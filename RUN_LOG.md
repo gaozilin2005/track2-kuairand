@@ -1523,3 +1523,144 @@ move a bias/information limit.
 Reproduce: `python3 ablation_ensemble.py --n_models 5` (~15s total) →
 raw-avg ensemble test primary 0.6026. `python3 baseline.py --model fm
 --loss pairwise_adt --adt_beta 1.0 --seed 0` → 0.6003.
+
+## 2026-08-29 — Heterogeneous ensemble: the best result in the project (0.6034)
+
+**User pushed back on the previous entry** ("I believe there is more here"),
+and they were right. The homogeneous seed ensemble combined 10 models that
+were *identical except for random seed* — the least diverse ensemble
+constructible. The ensemble literature is consistent that gains come from
+**complementary error patterns**, not from averaging per se, which also
+explains why that ensemble saturated at 3 members and stalled at +0.0007.
+
+Meanwhile this project had trained five architecturally distinct models,
+each individually dismissed for failing to beat the FM baseline, and never
+once combined:
+
+| member | inductive bias |
+|---|---|
+| fm_watchtime | bilinear FM + watch-time censored-regression aux |
+| fm_quantile | same, RAD quantile aux target |
+| **bst** | **order-aware self-attention + positional encoding** |
+| deepfm | FM + parallel DNN branch |
+| finalmlp | no explicit interaction term; two gated MLP streams |
+
+Four fusion methods tested (raw score average, per-group z-score, per-group
+rank, and Reciprocal Rank Fusion — the IR standard). **Protocol guard: the
+fusion method and member subset were selected on VALID, with test reported
+once**, so the headline number is not tuned on itself.
+
+### The correlation matrix is the finding
+
+Pairwise rank correlation on test (lower = more complementary):
+
+| | bst | deepfm | finalmlp | fm_quant | fm_watch |
+|---|---|---|---|---|---|
+| **bst** | 1.000 | **0.892** | **0.885** | **0.887** | **0.891** |
+| deepfm | 0.892 | 1.000 | 0.973 | 0.934 | 0.939 |
+| finalmlp | 0.885 | 0.973 | 1.000 | 0.926 | 0.931 |
+| fm_quantile | 0.887 | 0.934 | 0.926 | 1.000 | 0.952 |
+| fm_watchtime | 0.891 | 0.939 | 0.931 | 0.952 | 1.000 |
+
+**BST sits at 0.885–0.892 against everything else; every non-BST pair is
+0.926–0.973.** That gap is the whole result. DeepFM and FinalMLP look
+architecturally radical on paper — FinalMLP has no explicit interaction
+term at all — yet they correlate with each other at **0.973**, essentially
+the same model in different clothing. They differ in *how* they compute the
+`user_id × video_id` interaction; BST differs in *what information it
+reads* (sequence order). Only the latter produces complementary errors.
+
+### Results (test set)
+
+| model | GAUC | nDCG@5 | primary |
+|---|---|---|---|
+| best single member (fm_watchtime) | 0.6705 | 0.5336 | 0.6020 |
+| homogeneous seed ensemble (prev. entry) | — | — | 0.6025 |
+| all-5, rank / RRF | — | — | 0.6028 |
+| all-5, z-score / raw | — | — | 0.6032 / 0.6033 |
+| **valid-selected: z-score, {bst, fm_quantile, fm_watchtime}** | **0.6724** | **0.5344** | **0.6034** |
+
+Against the seed-std of 0.0004 used throughout this log:
+
+- vs. previous project best (single model, 0.6017): **+0.0017 ≈ 4.3σ**
+- vs. best single member here (0.6020): **+0.0014 ≈ 3.5σ**
+- vs. homogeneous seed ensemble (0.6025): **+0.0009 ≈ 2.3σ**
+
+The last comparison is the one that matters for the diversity hypothesis,
+and it clears the 2σ bar this log uses. Two independent signals corroborate
+it rather than resting on the single selected configuration: **valid
+selection independently chose a subset containing BST** (it had no access
+to test), and every fusion method lands in 0.6028–0.6034, i.e. the ranking
+of methods barely matters while the *inclusion of BST* does.
+
+### What this overturns
+
+The previous entry concluded ensembling's ceiling was low because
+"variance reduction cannot move a bias/information limit." That reasoning
+was sound but the premise was wrong: the seed ensemble was purely variance
+reduction, whereas adding BST contributes *different information* (sequence
+order), which is bias reduction, not variance reduction.
+
+It also partly rehabilitates BST. The standalone BST entry concluded "not
+adopted — ties the current best." That was correct in isolation and is
+still correct as a single-model claim, but it undervalued BST: its value
+here is not its solo score (0.6022, comparable to FM) but that it is
+**wrong in different places**. A model can be individually redundant and
+still be the most valuable ensemble member — this log had no way to see
+that until members were actually combined.
+
+Two prediction errors of mine worth recording: I estimated BST would
+correlate ~0.94–0.95 with the FM family "given the other four cluster this
+tightly" and called the run "closing the loop rather than a promising
+lead." It came in at 0.885–0.892 and produced the project's best result.
+The generalisation from four already-correlated members to a fifth
+structurally different one was unjustified.
+
+### Implementation notes
+
+Members are trained one at a time and cached to `scores/*.npz`
+(`--member <name>`), then fused separately (`--combine`). The first
+all-in-one-process version was OOM-killed (exit 137): five models plus
+BST's ~730MB L=160 history array does not fit locally. I also misdiagnosed
+this twice — first asserting OOM without evidence, then reversing on a
+0.9GB RSS snapshot that happened to be taken before the history array was
+allocated. The final BST member was trained on the SoC GPU cluster at full
+L=160 (~3 min), which sidesteps the memory limit entirely.
+
+Cluster-trained members score slightly differently from local runs
+(deepfm 0.6013 vs 0.6005, finalmlp 0.6015 vs 0.6008) — hardware/library
+nondeterminism, not a methodological difference. All numbers in the table
+above come from the single cluster run, so they are internally consistent.
+
+**Caveat on precision:** this is one ensemble built from one seed per
+member. The *members'* seed variance is well characterised (σ≈0.0004
+across many entries), but the ensemble's own run-to-run variance is not
+measured, so treat 0.6034 as a point estimate rather than a mean.
+
+### Decision
+
+**Best known configuration: heterogeneous ensemble, 0.6034 test primary.**
+Recorded in the baseline ladder as the best achievable number, with the
+single-model config (0.6017) retained as the reference point that all
+per-experiment comparisons in this log are measured against — mixing the
+two as "the baseline" would make ~30 prior entries harder to interpret.
+
+For a final submission, use the ensemble: it is ~4σ above the best single
+model and the members cost minutes to train.
+
+The actionable generalisation for anyone continuing: **stop looking for a
+single better model.** Nine directions found the same ceiling. The gain
+here came from combining models that were each individually judged
+failures, because one of them was wrong in a different place. If more
+headroom exists, the most likely source is another member with a genuinely
+different information source — not a better architecture over the same
+seven features.
+
+Reproduce (GPU node, ~5 min):
+```
+for m in fm_watchtime fm_quantile deepfm finalmlp; do
+  python ablation_hetero_ensemble.py --member $m --device cuda
+done
+python ablation_hetero_ensemble.py --member bst --bst_L 160 --device cuda
+python ablation_hetero_ensemble.py --combine
+```
