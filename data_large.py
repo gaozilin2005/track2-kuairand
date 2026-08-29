@@ -15,7 +15,7 @@ Pure 有 140 万行，大约 280MB，没问题；但 1K 有 1170 万行（约 2.
 时序特征（prior_exposure / author_recency）这里暂不构建——它们要按 (user, author) 分组
 做全量时间扫描，在这个数据量下是另一个量级的工程，先把 baseline 打通。
 """
-import csv, os
+import csv, glob, os
 import numpy as np
 
 SPLITS = {'train': (20220408, 20220421),
@@ -45,32 +45,38 @@ def load_columnar(data_dir, suffix='1k', verbose=True):
     cols = {name: {k: [] for k in ('user', 'video', 'author', 'tab', 'dur', 'label', 'click')}
             for name in SPLITS}
 
+    # 27K 把每个日期段的日志切成了 part1/part2（Pure/1K 都是单文件）——用 glob 通配，
+    # 排序后按 part1→part2 顺序读，不需要在磁盘上拼接（省掉重复存一份 ~9GB 数据，
+    # 也避免拼接时中间嵌进第二份文件自己的表头行导致那一行解析出错）。
     n_read = 0
-    for f in (f'log_standard_4_08_to_4_21_{suffix}.csv',
-              f'log_standard_4_22_to_5_08_{suffix}.csv'):
-        path = os.path.join(data_dir, f)
-        if not os.path.exists(path):
-            raise SystemExit(f'missing {path}')
-        with open(path) as fh:
-            for r in csv.DictReader(fh):
-                d = int(r['date'])
-                split = None
-                for name, (lo, hi) in SPLITS.items():
-                    if lo <= d <= hi:
-                        split = name; break
-                if split is None:
-                    continue
-                c = cols[split]
-                c['user'].append(_code(u_d, r['user_id']))
-                c['video'].append(_code(v_d, r['video_id']))
-                c['author'].append(_code(a_d, vid2author.get(r['video_id'], 'UNK')))
-                c['tab'].append(_code(t_d, r['tab']))
-                c['dur'].append(float(r['duration_ms']))
-                c['label'].append(1 if r['long_view'] != '0' else 0)
-                c['click'].append(1 if r['is_click'] != '0' else 0)
-                n_read += 1
-                if verbose and n_read % 2_000_000 == 0:
-                    print(f'    {n_read/1e6:.0f}M rows ...')
+    for pattern in (f'log_standard_4_08_to_4_21_{suffix}*.csv',
+                    f'log_standard_4_22_to_5_08_{suffix}*.csv'):
+        paths = sorted(glob.glob(os.path.join(data_dir, pattern)))
+        if not paths:
+            raise SystemExit(f'no files matching {pattern} in {data_dir}')
+        if verbose and len(paths) > 1:
+            print(f'  {pattern} -> {len(paths)} parts: {[os.path.basename(p) for p in paths]}')
+        for path in paths:
+            with open(path) as fh:
+                for r in csv.DictReader(fh):
+                    d = int(r['date'])
+                    split = None
+                    for name, (lo, hi) in SPLITS.items():
+                        if lo <= d <= hi:
+                            split = name; break
+                    if split is None:
+                        continue
+                    c = cols[split]
+                    c['user'].append(_code(u_d, r['user_id']))
+                    c['video'].append(_code(v_d, r['video_id']))
+                    c['author'].append(_code(a_d, vid2author.get(r['video_id'], 'UNK')))
+                    c['tab'].append(_code(t_d, r['tab']))
+                    c['dur'].append(float(r['duration_ms']))
+                    c['label'].append(1 if r['long_view'] != '0' else 0)
+                    c['click'].append(1 if r['is_click'] != '0' else 0)
+                    n_read += 1
+                    if verbose and n_read % 2_000_000 == 0:
+                        print(f'    {n_read/1e6:.0f}M rows ...')
 
     out = {}
     for name, c in cols.items():
