@@ -112,3 +112,46 @@ def watch_time_targets(splits, scale=12.0):
         tau = (np.log1p(dur) / scale).astype(np.float32)
         out[name] = (t, tau, censored)
     return out
+
+def watch_time_quantile_targets(splits, n_dur_groups=10):
+    """RAD（Relative Advantage Debiasing, AAAI 2025）风格的观看时长目标：不回归观看时长
+    的绝对值，而是回归它在**同时长组**经验分布里的分位数——"这次看的时间，相对于同样
+    长短的视频通常被看多久，算长还是短"。
+
+    动机（已在本数据上验证）：原始 log1p(play_time) 跟 long_view 的全局相关是 0.596，
+    但在时长分组**内部**是 0.46~0.64——说明视频时长确实混淆了这个信号，正是 RAD 要
+    修的东西。分位数目标同时天生抗离群：极端循环播放只会变成"分位数≈1"，不会变成一个
+    数值巨大、扭曲平方损失的目标，所以不再需要 watch_time_targets 里那种手工截断。
+
+    分组边界只用 train 估计（避免泄漏），valid/test 用同一套边界和同一套经验分布。
+    删失处理跟 watch_time_targets 一致：播完的行只知道"至少这么高"，tau 取
+    duration 在该组分布里的分位数，作为单侧损失的下界。
+    返回 {split: (t, tau, censored)}，语义与 watch_time_targets 相同，可直接互换。"""
+    tr = splits['train']
+    dur_tr = np.array([x[5] for x in tr], dtype=np.float64)
+    pt_tr = np.array([x[9] for x in tr], dtype=np.float64)
+    dur_edges = np.quantile(dur_tr, np.linspace(0, 1, n_dur_groups + 1)[1:-1])
+    g_tr = np.searchsorted(dur_edges, dur_tr)
+    # 每组一份经验分布（只用 train 的观看时长），后面用 searchsorted 查分位数。
+    refs = [np.sort(pt_tr[g_tr == g]) for g in range(n_dur_groups)]
+
+    def quantile_of(vals, groups):
+        q = np.empty(len(vals), dtype=np.float64)
+        for g in range(n_dur_groups):
+            m = groups == g
+            if not np.any(m):
+                continue
+            ref = refs[g]
+            q[m] = np.searchsorted(ref, vals[m], side='right') / max(len(ref), 1)
+        return q
+
+    out = {}
+    for name, rws in splits.items():
+        pt = np.array([x[9] for x in rws], dtype=np.float64)
+        dur = np.array([x[5] for x in rws], dtype=np.float64)
+        g = np.searchsorted(dur_edges, dur)
+        censored = pt >= dur
+        t = quantile_of(pt, g).astype(np.float32)      # 分位数已在 [0,1]，不需要额外 scale
+        tau = quantile_of(dur, g).astype(np.float32)
+        out[name] = (t, tau, censored)
+    return out

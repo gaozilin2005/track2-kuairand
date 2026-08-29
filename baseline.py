@@ -295,7 +295,8 @@ def _listwise_epoch_batches(groups, rng, bs):
 
 def run_fm(splits, k=16, lr=0.001, epochs=40, bs=8192, patience=4, seed=0, loss='pointwise',
            lambda_k=5, aux_weight=0.2, aux_target_train=None, wt_target_train=None,
-           click_weight=None, wt_weight=None, verbose=True):
+           click_weight=None, wt_weight=None, dns_n=8, dns_warmup=3, dns_lr_decay=0.2,
+           adt_beta=0.25, adt_warmup=3, verbose=True):
     enc, dim = encode(splits)
     Xtr, ytr, utr = enc['train']; Xva, yva, uva = enc['valid']; Xte, yte, ute = enc['test']
     m = FM(dim, k=k, lr=lr, seed=seed)
@@ -312,13 +313,14 @@ def run_fm(splits, k=16, lr=0.001, epochs=40, bs=8192, patience=4, seed=0, loss=
                           "例如 data.watch_time_targets(splits)['train']")
 
     if loss in ('pairwise', 'listwise', 'lambdarank', 'pairwise_multitask',
-                'pairwise_watchtime', 'pairwise_combined'):
+                'pairwise_watchtime', 'pairwise_combined', 'pairwise_dns', 'pairwise_adt'):
         # 只对有正有负的用户训练排序损失，与 GAUC 的用户口径一致（全正/全负组对组内排序无意义）。
         user_pos = collections.defaultdict(list); user_neg = collections.defaultdict(list)
         for i, (u, yv) in enumerate(zip(utr, ytr)):
             (user_pos if yv > 0 else user_neg)[u].append(i)
         mixed = [u for u in user_pos if u in user_neg]
-        if loss in ('pairwise', 'lambdarank', 'pairwise_multitask', 'pairwise_watchtime', 'pairwise_combined'):
+        if loss in ('pairwise', 'lambdarank', 'pairwise_multitask', 'pairwise_watchtime',
+                    'pairwise_combined', 'pairwise_dns', 'pairwise_adt'):
             # 每个正例配一个同用户负例（该用户曝光内）。
             pos_blocks = [np.array(user_pos[u]) for u in mixed]
             neg_pools = [np.array(user_neg[u]) for u in mixed]
@@ -416,6 +418,71 @@ def run_fm(splits, k=16, lr=0.001, epochs=40, bs=8192, patience=4, seed=0, loss=
             if verbose:
                 print(f"    aux click BCE: {np.mean([c for _, c, _ in step_losses]):.4f} (weight={click_weight}) | "
                       f"aux watchtime loss: {np.mean([w for _, _, w in step_losses]):.4f} (weight={wt_weight})")
+        elif loss == 'pairwise_adt':
+            # Adaptive Denoising Training（Wang et al., WSDM 2021）的 reweighted 变体（R-CE）：
+            # 噪声交互在训练早期表现为**大 loss**，所以按 loss 大小降权，而不是像 DNS 那样
+            # 反过来专挑最难的样本。这正是 DNS 失败诊断的反向验证——如果"专注高 loss 样本"
+            # 会让训练崩（实测如此），那"系统性地给高 loss 样本降权"就该有帮助。
+            # 这个数据集的标签噪声不是假设：long_view 本质是观看时长过 18 秒阈值的离散化
+            # （单这一条就能猜中 96.7%），卡在阈值附近的曝光基本等于抛硬币。
+            # 权重 w = (1 - sig)^beta，sig=sigmoid(zpos-zneg) 越小（loss 越大）权重越低。
+            # beta=0 退化成普通 BPR；beta 越大降权越狠。
+            neg_idx_all = np.concatenate([rng.choice(pool, size=c, replace=True)
+                                           for pool, c in zip(neg_pools, counts)])
+            perm = rng.permutation(len(pos_idx_all))
+            pi, ni = pos_idx_all[perm], neg_idx_all[perm]
+            losses = []
+            drop_fracs = []
+            for i in range(0, len(pi), bs):
+                bpi, bni = pi[i:i + bs], ni[i:i + bs]
+                zp = m.predict(Xtr[bpi]); zn = m.predict(Xtr[bni])
+                sig = sigmoid(zp - zn)
+                # 早期 epoch 不降权（模型还没学出东西，大 loss 不代表噪声，跟 DNS 的 warmup 同理）
+                if ep <= adt_warmup:
+                    w = None
+                else:
+                    w = (np.maximum(sig, 1e-6) ** adt_beta).astype(np.float32)
+                    drop_fracs.append(float((w < 0.5).mean()))
+                losses.append(m.step_pairwise(Xtr[bpi], Xtr[bni], weight=w))
+            if verbose:
+                if ep <= adt_warmup:
+                    print(f"    adt: warmup epoch ({ep}/{adt_warmup}), no reweighting")
+                else:
+                    print(f"    adt: beta={adt_beta}, frac of pairs downweighted below 0.5 = {np.mean(drop_fracs):.3f}")
+        elif loss == 'pairwise_dns':
+            # Dynamic Negative Sampling：每个正例先随机抽 dns_n 个候选负例（同用户曝光内），
+            # 用本 epoch 开始时的模型状态打分，挑分数最高（当前模型最容易搞错）的一个当负例。
+            # rank 每个 epoch 算一次，不逐 step 重算（跟 lambdarank 的取舍一致，见其注释）。
+            # 前 dns_warmup 个 epoch 先用普通随机负例——对着还没学出结构的随机 embedding
+            # 挑"最难"负例等于在追噪声，实测（见 RUN_LOG.md）不warmup 会直接训练不稳定
+            # （loss 不降反升）。这是 hard negative mining 文献里的标准做法，不是本项目独有的权宜之计。
+            if ep <= dns_warmup:
+                neg_idx_all = np.concatenate([rng.choice(pool, size=c, replace=True)
+                                               for pool, c in zip(neg_pools, counts)])
+                perm = rng.permutation(len(pos_idx_all))
+                pi, ni = pos_idx_all[perm], neg_idx_all[perm]
+                if verbose:
+                    print(f"    dns: warmup epoch ({ep}/{dns_warmup}), plain random negative")
+            else:
+                if ep == dns_warmup + 1:
+                    # 硬负例让 sigmoid(zpos-zneg) 更接近 0.5，每一步的梯度幅度都比随机负例
+                    # 大得多（随机负例经常已经分对，sigmoid≈1，梯度≈0；硬负例几乎每步都有实质
+                    # 梯度）——相当于变相调高了有效学习率，Adam 的一阶/二阶矩估计跟不上就会
+                    # 震荡（实测：不降 lr 直接 loss 不降反升，见 RUN_LOG.md）。切换时降一次 lr，
+                    # 是 hard negative mining 文献里的标准做法。
+                    m.lr *= dns_lr_decay
+                    if verbose:
+                        print(f"    dns: switching to hard negatives, lr *= {dns_lr_decay} -> {m.lr:.6f}")
+                cand_idx = np.concatenate([rng.choice(pool, size=(c, dns_n), replace=True)
+                                            for pool, c in zip(neg_pools, counts)])   # (n_pos, dns_n)
+                cand_scores = m.predict(Xtr[cand_idx.reshape(-1)]).reshape(cand_idx.shape)
+                hardest = cand_idx[np.arange(len(cand_idx)), cand_scores.argmax(axis=1)]
+                perm = rng.permutation(len(pos_idx_all))
+                pi, ni = pos_idx_all[perm], hardest[perm]
+                if verbose:
+                    print(f"    dns: mean hardest-candidate score={cand_scores.max(axis=1).mean():.4f} "
+                          f"vs mean candidate score={cand_scores.mean():.4f} (n={dns_n})")
+            losses = [m.step_pairwise(Xtr[pi[i:i + bs]], Xtr[ni[i:i + bs]]) for i in range(0, len(pi), bs)]
         else:
             idx = rng.permutation(len(ytr))
             losses = [m.step(Xtr[idx[i:i + bs]], ytr[idx[i:i + bs]]) for i in range(0, len(idx), bs)]
@@ -446,13 +513,15 @@ if __name__ == '__main__':
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--loss', default='pairwise_watchtime',
                     choices=['pointwise', 'pairwise', 'listwise', 'lambdarank',
-                             'pairwise_multitask', 'pairwise_watchtime', 'pairwise_combined'],
+                             'pairwise_multitask', 'pairwise_watchtime', 'pairwise_combined', 'pairwise_dns',
+                             'pairwise_adt'],
                     help='仅对 --model fm 生效：pairwise_watchtime（BPR + CWM 风格观看时长删失回归辅助任务，'
                          '默认，5-seed test primary 0.6017 > 纯 BPR（7 域）的 0.6008，见 RUN_LOG.md）/ '
                          'pairwise（BPR，无辅助任务）/ pointwise（logloss，原官方 baseline）/ '
                          'listwise（组内 softmax，已实测更差）/ lambdarank（BPR × |ΔnDCG@lambda_k|，已实测更差）/ '
                          'pairwise_multitask（BPR + is_click 辅助 BCE，已实测无收益）/ '
-                         'pairwise_combined（BPR + is_click + watchtime 两个辅助任务一起训练，各自独立头）')
+                         'pairwise_combined（BPR + is_click + watchtime 两个辅助任务一起训练，各自独立头）/ '
+                         'pairwise_dns（Dynamic Negative Sampling：每个正例从 dns_n 个候选负例里挑当前模型打分最高的一个）')
     ap.add_argument('--lambda_k', type=int, default=5, help='lambdarank 用的截断位置，默认对齐 nDCG@5')
     ap.add_argument('--aux_weight', type=float, default=0.2,
                     help='pairwise_multitask / pairwise_watchtime 用：辅助任务 loss 对共享 V 的梯度权重')
@@ -460,6 +529,20 @@ if __name__ == '__main__':
                     help='pairwise_combined 用：is_click 头的权重，不传则用 --aux_weight')
     ap.add_argument('--wt_weight', type=float, default=None,
                     help='pairwise_combined 用：watchtime 头的权重，不传则用 --aux_weight')
+    ap.add_argument('--dns_n', type=int, default=8,
+                    help='pairwise_dns 用：每个正例采样的候选负例个数，从中选分数最高的一个')
+    ap.add_argument('--dns_warmup', type=int, default=3,
+                    help='pairwise_dns 用：前几个 epoch 用普通随机负例，之后再切到 hard negative')
+    ap.add_argument('--dns_lr_decay', type=float, default=0.2,
+                    help='pairwise_dns 用：切到 hard negative 时 lr 乘的系数，避免梯度幅度突增导致震荡')
+    ap.add_argument('--adt_beta', type=float, default=0.25,
+                    help='pairwise_adt 用：降权强度，w=(sigmoid(zpos-zneg))^beta，0 等于不降权')
+    ap.add_argument('--adt_warmup', type=int, default=3,
+                    help='pairwise_adt 用：前几个 epoch 不降权（早期大 loss 不代表噪声）')
+    ap.add_argument('--wt_target', default='log', choices=['log', 'quantile'],
+                    help='pairwise_watchtime / pairwise_combined 用：辅助任务的目标形式。'
+                         'log=截断+log1p 回归（默认，当前最优 0.6017 用的就是这个）；'
+                         'quantile=RAD（AAAI 2025）风格，回归观看时长在同时长组经验分布里的分位数')
     a = ap.parse_args()
     print(f"loading {a.data_dir} ...")
     splits = load(a.data_dir)
@@ -469,13 +552,20 @@ if __name__ == '__main__':
         from data import aux_labels
         aux_train = aux_labels(splits)['train']
     if a.loss in ('pairwise_watchtime', 'pairwise_combined'):
-        from data import watch_time_targets
-        wt_train = watch_time_targets(splits)['train']
+        if a.wt_target == 'quantile':
+            from data import watch_time_quantile_targets
+            wt_train = watch_time_quantile_targets(splits)['train']
+        else:
+            from data import watch_time_targets
+            wt_train = watch_time_targets(splits)['train']
     res = {'pop': run_pop, 'random': lambda s: run_random(s, a.seed),
            'fm': lambda s: run_fm(s, k=a.k, lr=a.lr, epochs=a.epochs, seed=a.seed,
                                    loss=a.loss, lambda_k=a.lambda_k, aux_weight=a.aux_weight,
                                    aux_target_train=aux_train, wt_target_train=wt_train,
-                                   click_weight=a.click_weight, wt_weight=a.wt_weight)}[a.model](splits)
+                                   click_weight=a.click_weight, wt_weight=a.wt_weight,
+                                   dns_n=a.dns_n, dns_warmup=a.dns_warmup,
+                                   dns_lr_decay=a.dns_lr_decay,
+                                   adt_beta=a.adt_beta, adt_warmup=a.adt_warmup)}[a.model](splits)
     print(f"\n=== {a.model} (seed={a.seed}, loss={a.loss}) ===")
     for sp in ('valid', 'test'):
         r = res[sp]

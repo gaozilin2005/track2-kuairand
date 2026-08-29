@@ -6,3 +6,5 @@ KuaiRand-Pure/
 KuaiRand-Pure.tar.gz
 logs/
 .DS_Store
+scores/
+.claude/

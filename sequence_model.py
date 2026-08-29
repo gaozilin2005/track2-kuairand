@@ -171,7 +171,7 @@ def _predict(model, X, H, device, bs=8192):
 
 def run_seq(splits, k=16, hidden=32, lr=0.001, epochs=40, bs=8192, patience=4,
             seed=0, L=160, device='auto', arch='din',
-            n_heads=4, n_layers=1, ff_dim=64, dropout=0.1, verbose=True):
+            n_heads=4, n_layers=1, ff_dim=64, dropout=0.1, verbose=True, return_scores=False):
     device = resolve_device(device) if isinstance(device, str) else device
     enc, dim = encode(splits)
     vocabs, unk, field_dims, offsets, edges = build_vocab(splits)
@@ -237,8 +237,11 @@ def run_seq(splits, k=16, hidden=32, lr=0.001, epochs=40, bs=8192, patience=4,
                 break
 
     model.load_state_dict(best_state)
-    return {'valid': evaluate(uva, yva, _predict(model, Xva, Hva, device)),
-            'test':  evaluate(ute, yte, _predict(model, Xte, Hte, device))}
+    sva, ste = _predict(model, Xva, Hva, device), _predict(model, Xte, Hte, device)
+    if return_scores:
+        return {'valid_scores': sva, 'test_scores': ste,
+                'valid': evaluate(uva, yva, sva), 'test': evaluate(ute, yte, ste)}
+    return {'valid': evaluate(uva, yva, sva), 'test': evaluate(ute, yte, ste)}
 
 
 if __name__ == '__main__':

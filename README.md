@@ -143,11 +143,17 @@ python3 submit.py --score --split valid submission.csv    # 校验并打分（�
 |---|---|
 | **换损失函数为 BPR（pairwise）** | primary **0.5971** vs pointwise 的 **0.5946**（5 seed 均稳定，+0.0025 > 收敛阈值 ε=0.002）。**有收益，已设为默认**（`--loss pairwise`）。同时试了 listwise（组内 softmax，0.5931，比 pointwise 还低）和 LambdaRank@5（BPR × \|ΔnDCG@5\|，0.5891，两个子指标都更差 —— 78% 的采样 pair 因排在 top-5 之外被截断权重清零，梯度信号不足）。细节见 `RUN_LOG.md`。 |
 | **用户历史序列（DIN 风格 attention）** —— `sequence_model.py`，PyTorch，最近 160 条 long_view=1 历史对候选 video_id 做 attention，接入 FM 交互项 | primary **0.5967**（第一版）/ **0.5969**（把 same_video 精确命中标志显式拼进 attention 输入后），都跟 BPR FM 的 **0.5971** 在噪声内无差别。**attention 机制本身两次都没有收益。** |
-| **↳ 但序列信号本身是真实存在的** —— `prior_exposure`（是否精确复看过这个视频，二值，`ablation_prior_exposure.py`）+0.0015；`author_recency`（离上次看这个作者的作品过了多久，分桶，`ablation_author_recency.py`）+0.0017；`adjacency`（是否紧接在同一作者的一次 long_view 之后，二值，`ablation_adjacency.py`）单独也有 **0.5986**，几乎完全接住 author_recency 的收益——说明这个时序信号本质是 session 边界的阶梯效应，不是 DIEN 假设的平滑衰减。**两个都有收益，已收编进 `data.py`/`baseline.py` 默认（见上面 Baseline 阶梯，+0.0037）。** 结论：不是"没有序列信号可挖"，是 DIN 的 softmax attention 没能从这个数据集里学会利用它；这对要不要投入 DIEN 是个负面信号，BST（靠自注意力捕捉顺序，不假设平滑演化）不受影响，仍是待测方向。完整推导见 `RUN_LOG.md`。 |
+| **↳ 但序列信号本身是真实存在的** —— `prior_exposure`（是否精确复看过这个视频，二值，`ablation_prior_exposure.py`）+0.0015；`author_recency`（离上次看这个作者的作品过了多久，分桶，`ablation_author_recency.py`）+0.0017；`adjacency`（是否紧接在同一作者的一次 long_view 之后，二值，`ablation_adjacency.py`）单独也有 **0.5986**，几乎完全接住 author_recency 的收益——说明这个时序信号本质是 session 边界的阶梯效应，不是 DIEN 假设的平滑衰减。**两个都有收益，已收编进 `data.py`/`baseline.py` 默认（见上面 Baseline 阶梯，+0.0037）。** 结论：不是"没有序列信号可挖"，是 DIN 的 softmax attention 没能从这个数据集里学会利用它。 |
+| **↳ BST（GPU 上验证）** —— `sequence_model.py --arch bst`，SoC 集群 GPU（~22s/epoch，比 CPU 快约 110 倍），自注意力+位置编码替换 DIN 的无序 pooling | primary **0.6014**（5 seed），比 DIN 高 **+0.0045~0.0047**（10~12 个标准误差，这份记录里最不含糊的一个结果）——**证实了顺序信息确实有用，DIN 的问题就是机制本身**。但跟当前 7 域 FM 干净基线（0.6008）比只高 +0.0006（约 1.5 个标准误差，没到平时的确认门槛），跟当前最优（含 watchtime，0.6017）比几乎打平（−0.0003）。**没有超过现有最优，不采用**——self-attention 挖到的信号跟手工时序特征 + watchtime 辅助任务已经挖到的高度重合。完整推导（含集群踩坑记录）见 `RUN_LOG.md`。 |
 | **多任务（is_click）** —— `baseline.py --loss pairwise_multitask`，BPR 主任务 + is_click 辅助 BCE（共享 embedding，各自独立一阶项），`aux_weight` 试了 0.2 和 1.0 | primary **0.6007**（weight=0.2，5 seed）/ **0.5999**（weight=1.0，单 seed），跟当前最优 7 域 FM 的 **0.6008** 在噪声内无差别，权重更大甚至略降。**没有收益，两个权重都试过，不是权重没调对。** 推测：is_click 和 long_view 相关但是漏斗的不同阶段，共享 embedding 可能已经被主任务的 BPR 梯度训练得足够好，辅助任务没有再挤出新信息，反而分走了一部分梯度预算。细节见 `RUN_LOG.md`。 |
 | **多任务（CWM 风格观看时长删失回归）** —— `baseline.py --loss pairwise_watchtime`（默认），BPR 主任务 + 观看时长辅助回归。播完的行（17.3%）不能直接拿 play_time_ms 当目标——中位数只超出 1.09 倍，但有个从 p90 开始暴涨到 802 倍的极端拖尾（大概率是放着不管的循环播放，不是真兴趣），所以播完的行统一用 duration_ms 当单侧下界（削失回归/Tobit 损失），没播完的行才用 play_time_ms 精确回归 | primary **0.6017** vs 纯 BPR 7 域的 **0.6008**（5 seed 均稳定，+0.0009，标准误差算约 3.6σ，但比 BPR/时序特征那几步的效应量小）。**有收益，已设为默认。** 之所以比 is_click 有效：play_time_ms>=18s 单独就能猜中 96.7% 的 long_view，说明 long_view 本来就是观看时长离散化后的版本，不是一个独立信号——辅助任务教的是同一件事的更细粒度版本，不是另一件相关的事。细节见 `RUN_LOG.md`。 |
 | **换模型（DeepFM）** —— `deepfm_model.py`，PyTorch，在 FM 交互项上并行加一个小 DNN 分支（7 域 embedding 拼接过 2 层 MLP，`z = z_FM + z_DNN`），跟纯 BPR FM 7 域（不叠 watchtime）对照 | primary **0.6007** vs **0.6008**，几乎完全无差别（−0.0001）。**没有收益。** 跟容量消融是同一个结论的又一次印证：`user_id × video_id` 交叉已经吃掉了这批特征里大部分可学信号，不管额外表达能力来自哪（更大 embedding / DNN 非线性组合）都挖不出新东西。 |
 | **↳ 换模型（FinalMLP）** —— `finalmlp_model.py`，PyTorch，完全弃用显式交互结构：两路 MLP，各自对同一份 embedding 做独立的 MMOE 风格门控加权，再用多头双线性融合两路输出（AAAI 2023，在多个基准上超过 DCNv2/xDeepFM），跟 DeepFM 用同一对照基准 | primary **0.6002** vs **0.6008**（−0.0006，5 seed 稳定偏低，比 DeepFM 还差一点）。**没有收益，比"加法接入"的 DeepFM 还略差。** 推测：FinalMLP 完全没有显式双线性项，`user_id × video_id` 这个交叉只能靠两路 MLP 从零学出来，比 FM 精确解析这个交叉更难学，114 万行数据的规模下这个劣势没被它自己的架构优势抵消。DeepFM/FinalMLP 两次独立确认同一个结论——**换模型这条路线已经彻底摸清楚了**，问题不在架构表达能力，在这批特征本身没有更多可挖的结构。 |
+| **Dynamic Negative Sampling** —— `baseline.py --loss pairwise_dns`，每个正例从 `dns_n` 个候选负例里挑当前模型打分最高的一个（而非随机），理论上跟 Top-K 指标关联更强 | `dns_n=8` **训练不稳定**（loss 不降反升，GAUC/nDCG@5 一起往下掉，不是 LambdaRank 那种指标之间此消彼长）——热身 3 epoch + 切换时 lr×0.2 两个标准修复手段都没能挽救，只是让崩溃变慢。`dns_n=2`（更温和）训练稳定，但结果是干净的空转：primary **0.6006** vs **0.6008**（−0.0002，噪声内）。**没有收益。** 推测：这个数据集的物品池只有 7,538 个、复看率极高，"模型当前打分最高的负例"很可能是用户其实感兴趣、只是这次没看够阈值的视频——难负例挖掘理论上跟大物品池场景（负例基本可靠）不一样，这里挖到的更像是标签噪声而非真信号。细节见 `RUN_LOG.md`。 |
+| **训练集时间加权 / 截断** —— `ablation_train_window.py`。先发现一个此前没记录的数据结构事实：**训练集前 4 天（Apr 9-12）占了全部训练数据的 64%，曝光强度 7.4 impressions/user/day，而 valid/test 只有约 1.1**——同一批用户（91% 的 test 用户在 early train 出现过），是记录强度变了，不是人群变了 | 硬截断（只保留跟评测同强度的尾部）和软加权（保留全部数据、按时间指数衰减采样）**两种都单调变差**：硬截断 0.6020→0.5978→0.5928→0.5795（保留比例 100%→36%→17%→7.5%）；软加权半衰期 3/7/14 天分别是 0.5932/0.5996/0.5999，最温和的那档都够不着均匀采样的 0.6020。**没有收益。** 结论：**数据量压倒分布匹配**——FM 的参数以 `user_id`/`video_id` embedding 为主，每个 ID 需要足够的交互量才估得准，为了分布对齐而饿着它们是笔亏本买卖。那个 7 倍强度差本身是这个数据集值得知道的性质，但不构成可用的建模杠杆。细节见 `RUN_LOG.md`。 |
+| **观看时长辅助任务的分位数重参数化（RAD, AAAI 2025）** —— `baseline.py --wt_target quantile`，不回归观看时长绝对值，改回归它在**同时长组**经验分布里的分位数（天然抗离群，不需要手工截断）。先验证了前提确实成立：时长分组**内部**的 corr(观看时长, long_view) 是 0.46~0.64，高于全局的 0.596，说明时长确实混淆了信号 | 目标质量提升非常明显——跟 long_view 的相关系数从 **0.596 涨到 0.825**——但 primary **0.6016** vs 现默认 log 目标的 **0.6017**，完全打平（−0.0001）。**没有收益。** 这是本项目最尖锐的一个"目标变好但指标不动"的例子：辅助任务原本那 +0.0009 的收益来自"给共享 embedding 喂同一个信号的更细粒度版本"（`play_time>=18s` 单独就能猜中 96.7% 的 long_view），一旦 embedding 吸收完这部分，再怎么打磨辅助目标的参数化都没有增量——天花板由 `user_id × video_id` 能表达什么决定，不由训练信号的保真度决定。细节见 `RUN_LOG.md`。 |
+| **自适应去噪训练（ADT, WSDM 2021）** —— `baseline.py --loss pairwise_adt`，按 loss 大小给 pair 降权（`w=sigmoid(zpos-zneg)^beta`），噪声交互在训练早期表现为大 loss。**这是 DNS 那条路的反向验证**：DNS 专挑高 loss 样本（训崩了），ADT 反过来给它们降权 | beta=0.25/0.5/1.0/2.0（降权 pair 占比 0.8%/8.8%/30%/39%）对应 primary **0.6013/0.6007/0.6003/0.5979**——降权越狠越差，任何强度都够不着 0.6017。**没有收益。** 但跟 DNS 合起来结论更强：**高 loss 样本携带的是真信号，不是可丢弃的噪声**（两个方向都试过了：加权训崩、降权变差）。这也**部分推翻了 DNS 那条记录里"难负例基本是标签噪声"的推测**——那个假设能解释 DNS 崩掉，但它预测 ADT 应该有用，而实测没有。细节见 `RUN_LOG.md`。 |
+| **种子集成** —— `ablation_ensemble.py`，把 N 个 seed 训出的模型的**预测分**平均（之前每个实验都跑 5 seed，但只用来算 mean±std，从没把预测合起来用过）。测了原始分平均和组内 rank 平均两种聚合 | 单模型均值 0.6018 ± 0.0004 → 集成 **0.6025**（sizes 3-10 的平台估计，+0.0007，约 1.8σ）。**有小幅真实收益**：它高于 10 个 seed 里的**每一个**（最好的单 seed 是 0.6022），两种聚合方式也一致；但 3 个模型就饱和了，且 1.8σ 低于本项目平时认定"确定有效"的 2~3σ 门槛。**没有并入默认配置**（保持单模型作为可复现的对照基准），但做最终提交时值得用——3~5 个模型每个才 3 秒。这是最近九个方向里**唯一**有正收益的，原因也符合整体规律：其它方向都在试图从数据里榨出更多信号，而集成不需要更多信号，只是把已有信号提取得更稳——所以它的上限也很低，方差削减动不了偏差/信息天花板。细节见 `RUN_LOG.md`。 |
 | **加静态特征** —— 把 CWM 的 13 个特征域全接进来（+`music_id`/`video_type`/`upload_type` + 6 个用户侧粗桶） | primary **0.5940** vs 5 域的 **0.5950**，噪声内无差别，甚至略降。**没有收益。** |
 | **加模型容量** —— embedding 维度 k = 8 / 16 / 32 | 0.5895 / 0.5902 / 0.5887，几乎不动。**没有收益。** |
 
@@ -162,15 +168,20 @@ python3 submit.py --score --split valid submission.csv    # 校验并打分（�
 
 按我们判断的可能性排序（**这几条组委会没测过，是留给你们的**）：
 
-1. **BST（自注意力捕捉顺序，不是 DIEN 的平滑演化假设）。** DIN attention 本身没有收益，但序列
-   信号确实存在且已经被两个手工特征吃掉大半（见上）；DIEN 的核心机制（GRU 平滑演化）被
-   `author_recency` 的阶梯形状证伪，但 BST 不假设平滑演化，仍是合理的下一步——如果还想在
-   attention 这条路上继续投入的话。`sequence.py`/`sequence_model.py`（`--arch bst`）的历史构建 +
-   torch 训练基础设施已经现成，但训练在本机 CPU 上比 DIN 慢约 35 倍（self-attention 对小
-   head_dim 在 CPU 上效率很差），**正在等 GPU 集群跑**（`train_seq.sbatch`），结果见 `RUN_LOG.md`。
-2. **时间特征与分布漂移。** `hourmin`、`date`，以及 train 与 test 之间的漂移。
-3. **无偏验证（进阶）。** `log_random_4_22_to_5_08_pure.csv` 是随机曝光日志（118 万行），
-   可作为额外的无偏验证集，检查模型是否只在有偏流量上过拟合。
+1. **无偏验证（进阶）。** `log_random_4_22_to_5_08_pure.csv` 是随机曝光日志（118 万行），
+   可作为额外的无偏验证集，检查模型是否只在有偏流量上过拟合。注意这是**诊断工具，不是
+   提分杠杆**——主分永远在有偏的标准日志上算，这条不会直接抬高分数，但对理解模型行为
+   （以及写报告）有价值，也是这个数据集本身的研究主线（KuaiRand, CIKM 2022）。
+2. **`hourmin` 时段特征。** 分布漂移那一面已经试过了（见上，没有收益），但一天内的时段
+   本身还没当特征接进来过。考虑到静态特征加了一轮又一轮都是空结果，期望值不高。
+
+> ⚠️ **先读这个再挑方向。** 到目前为止，损失函数、静态特征、模型容量、模型架构（DeepFM /
+> FinalMLP）、序列建模（DIN / BST）、多任务、负采样策略、训练集时间加权、辅助目标的
+> 重参数化——**九条独立路线全部收敛到同一个结论**：这批特征上，`user_id × video_id` 交叉
+> 之外几乎没有可挖的结构，天花板在 0.601~0.602 附近，跟机制是否先进无关。唯二真正有效的
+> 两步（BPR 换损失 +0.0025、时序特征 +0.0037）都是**便宜的、针对性的**改动，不是更复杂的
+> 模型。如果要继续往上推，比起再试一个更强的模型，更值得想的是「有没有哪个信号是现在
+> 完全没接进来的」。
 
 ## 用你自己的模型（包括 CWM）
 
@@ -204,7 +215,7 @@ print(evaluate(user_ids, labels, scores))   # scores 可以来自任何模型
 | `evaluate.py` | 指标实现 + 全部口径约定。**不要改。** |
 | `data.py` | 数据加载、官方划分、特征编码。默认 7 域（5 静态 + `prior_exposure` + `author_recency`）。加静态特征改 `_raw_fields`。`aux_labels()` 提供多任务辅助标签（如 `is_click`）；`watch_time_targets()` 提供 CWM 风格删失回归目标。 |
 | `temporal_features.py` | `prior_exposure`/`author_recency` 两个跨行时序特征的构建逻辑（numpy-only），`data.py` 的 `encode()` 默认调用。 |
-| `baseline.py` | 三个 baseline。FM 是要打败的那个。`--loss` 支持 pointwise/pairwise/listwise/lambdarank/pairwise_multitask/pairwise_watchtime（默认）/pairwise_combined（is_click+watchtime 一起练，无额外收益）。 |
+| `baseline.py` | 三个 baseline。FM 是要打败的那个。`--loss` 支持 pointwise/pairwise/listwise/lambdarank/pairwise_multitask/pairwise_watchtime（默认）/pairwise_combined（is_click+watchtime 一起练，无额外收益）/pairwise_dns（hard negative mining，无收益，`dns_n` 大了还会训练不稳定）/pairwise_adt（按 loss 降权去噪，无收益，降得越狠越差）。`--wt_target` 可选 log（默认）/ quantile（RAD 风格分位数目标，实测与 log 打平）。 |
 | `baseline_scores.json` | 官方发布的分数 + 种子方差 + 收敛参数——**历史快照**（5 域 + pointwise），不随后续改动更新，跟当前默认配置的数字不再一致，当前数字见 README 的 Baseline 阶梯。 |
 | `submit.py` | 生成 / 校验提交文件。 |
 | `ablation_features.py` | 特征消融实验，可复现「加特征没有收益」那组数字。 |
@@ -212,8 +223,10 @@ print(evaluate(user_ids, labels, scores))   # scores 可以来自任何模型
 | `ablation_author_recency.py` | 诊断：`author_recency` 单独接 5 域 FM 的收益（+0.0017），形状是阶梯而非平滑衰减。已收编进 `data.py` 默认。 |
 | `ablation_adjacency.py` | 诊断：更简单的"是否紧接同作者一次 long_view 之后"二值特征，单独测出 0.5986，跟 `author_recency` 的收益几乎完全重合——证实阶梯效应就是全部收益来源。未收编（跟 `author_recency` 冗余）。 |
 | `ablation_author_watch_affinity.py` | 诊断：观看时长当特征用（历史参与"深度"而非"时机"），单独接 5 域 FM +0.0009，比 `author_recency` 弱。未收编。 |
+| `ablation_train_window.py` | 诊断：训练集按时间硬截断 / 软加权，测"训练分布该不该向评测期对齐"。两种都单调变差——数据量压倒分布匹配。见 `RUN_LOG.md`。 |
+| `ablation_ensemble.py` | 种子集成：把 N 个模型的预测分平均（原始分 / 组内 rank 两种聚合）。**最近九个方向里唯一有正收益的**（+0.0007，约 1.8σ，3 个模型即饱和）。见 `RUN_LOG.md`。 |
 | `sequence.py` | 用户历史序列构建（numpy-only）。给 `sequence_model.py` 用，也可单独复用。 |
-| `sequence_model.py` | DIN 风格历史 attention + FM（PyTorch）。两版（纯 pooling / 显式拼 same_video 标志）都没有收益，尽管序列信号本身确实存在（见上三行诊断）——问题在 DIN 的机制，不在数据。见 `RUN_LOG.md`。 |
+| `sequence_model.py` | `--arch din`：两版都没有收益，问题在机制不在数据。`--arch bst`：GPU 上验证，比 DIN 高 10+ 个标准误差（证实顺序信息有用），但跟当前最优打平，不采用。见 `RUN_LOG.md`。 |
 | `train_seq.sbatch` | 在 SoC GPU 集群上跑 `sequence_model.py` 的 Slurm 作业脚本（5 seed 并行，`--array=0-4`）。 |
 | `deepfm_model.py` | DeepFM（PyTorch）：FM 交互项上并行加一个小 DNN 分支。没有收益（干净的空结果），见 `RUN_LOG.md`。 |
 | `finalmlp_model.py` | FinalMLP（PyTorch）：完全弃用显式交互结构的两流 MLP + 门控 + 多头双线性融合。没有收益，比 DeepFM 还略差，见 `RUN_LOG.md`。 |

@@ -1017,3 +1017,509 @@ expressiveness in some form."
 
 Reproduce: `.venv/bin/python finalmlp_model.py --seed 0` → test primary
 0.6008.
+
+## 2026-08-29 — BST on GPU: decisively beats DIN, ties the overall best
+
+The long-pending BST run — the CPU estimate (~2450s/epoch, ~35x slower
+than DIN) made it impractical locally; user got SoC GPU cluster access
+working this session (SSH/VPN routing issues, a wrong-quota home directory
+for the pip install, and a scratch-directory permission dead-end all had
+to be worked through first — see below). Same `sequence_model.py --arch
+bst`, same L=160/BPR setup as every other DIN/BST entry, now run with
+`--device cuda` on an SoC GPU node (`xgpd0`, Titan V) instead of CPU.
+
+**GPU speedup:** ~22s/epoch vs. CPU's ~2450s/epoch — **~110x faster**,
+even on one of the cluster's older GPU types. Confirms the earlier
+hypothesis: the CPU slowness was PyTorch's training-mode attention
+implementation being inefficient for small per-head dimensions (k=16,
+4 heads), not a fundamental property of the model. All 5 seeds completed
+in well under 30 minutes total on GPU, vs. an estimated 1.5–3 days that
+would have been needed on CPU.
+
+**Cluster setup friction (worth recording for next time):** rsync/SSH from
+the local Mac to the login node timed out despite VPN showing connected
+(stale VPN routes after a network change — never fully diagnosed, worked
+around by pushing code to GitHub and `git clone`-ing from inside the
+cluster instead, which uses port 443 not 22). Then `pip install torch`
+hit "Disk quota exceeded" on the home directory (the actual per-user quota
+mechanism wasn't visible via the standard `quota -s` tool on this
+clustered filesystem) — attempted fix via a scratch directory
+(`/mnt/scratch/$USER`) hit a permission wall (no self-service scratch
+provisioning found for this account). Ultimately resolved by requesting
+an **interactive GPU allocation** (`srun --gpus=1 --pty bash`) and
+building the venv from there — same home-directory path that failed
+before, but succeeded this time (unclear exactly why — plausibly earlier
+failed attempts' partial downloads had been cleaned up by then, freeing
+enough quota). `sbatch train_seq.sbatch` (with `--array` overridable on
+the command line, e.g. `--array=1-4`) is the recommended path for the next
+GPU experiment, now that a working venv/path is confirmed — it survives
+SSH disconnection and time-limit concerns that an interactive session
+doesn't.
+
+Command: `.venv_gpu/bin/python sequence_model.py --arch bst --device cuda
+--seed <0..4>`, run interactively (each seed converged in 6–8 epochs,
+~2–3 minutes).
+
+### Results (test set, mean ± population std over seeds 0–4)
+
+| model | GAUC | nDCG@5 | primary |
+|---|---|---|---|
+| DIN, plain pooling (CPU, earlier entry) | 0.6634 (σ=0.0005) | 0.5299 (σ=0.0006) | 0.5967 (σ=0.0005) |
+| DIN + `same_video` input (CPU, earlier entry) | 0.6638 (σ=0.0006) | 0.5301 (σ=0.0006) | 0.5969 (σ=0.0006) |
+| BPR FM, 7 fields, clean (no watch-time) | 0.6689 (σ=0.0005) | 0.5326 (σ=0.0005) | 0.6008 (σ=0.0004) |
+| **BST (GPU)** | **0.6697** (σ=0.0009) | **0.5330** (σ=0.0006) | **0.6014** (σ=0.0007) |
+| BPR FM + temporal features + watch-time (current overall best) | 0.6689 (σ=0.0005) | 0.5333 (σ=0.0003) | 0.6017 (σ=0.0004) |
+
+Per-seed test primary: 0.6022, 0.6023, 0.6009, 0.6007, 0.6007.
+
+### Finding: the order-awareness hypothesis was correct — and the ceiling is still the same one
+
+**BST vs. DIN: +0.0045 to +0.0047, at 10.5–11.8× the standard error of the
+difference.** About as unambiguous a result as this log has recorded —
+not a marginal improvement, a clear one. This directly confirms what the
+DIN entries hypothesized: DIN's failure was specifically about its
+order-agnostic softmax-pooling mechanism (and its inability to learn to
+exploit rare-but-strong patterns like exact repeats), not about "no
+sequence signal existing" or sequence modeling being a dead end here.
+Adding positional encoding and self-attention over the *ordered* sequence
+recovers real value that pooling left on the table.
+
+**BST vs. the clean 7-field FM (no watch-time): +0.0006, ~1.5× standard
+error.** Directionally positive, consistently so, but doesn't clear this
+log's usual bar (~2–3×) for calling something a confirmed win on its own.
+
+**BST vs. the current overall best (FM + temporal features + watch-time,
+0.6017): −0.0003, a wash.** This is the more important comparison for
+deciding what to adopt. BST's self-attention over raw history apparently
+rediscovers much of the same signal that the hand-engineered temporal
+features (`prior_exposure`, `author_recency`) and the watch-time auxiliary
+task already extract more cheaply and reliably — consistent with this
+project's now-repeated finding (features/capacity/DeepFM/FinalMLP) that
+there isn't much additional structure in this dataset for a more
+sophisticated mechanism to find *beyond* what's already been claimed,
+whatever form that sophistication takes.
+
+### Decision
+
+**Not adopted as the new default** — ties the current best rather than
+beating it, and costs meaningfully more (GPU dependency, ~22s/epoch vs.
+numpy FM's ~2–3s/epoch, a whole separate cluster-access workflow) for no
+net gain over the existing hand-engineered-feature approach. But this
+closes out the sequence-modeling investigation with a clean, coherent
+story rather than an ambiguous one: DIN's *specific* mechanism was flawed
+(confirmed directly by BST's large improvement over it), sequence
+information genuinely exists in this data (confirmed independently three
+different ways now — `prior_exposure`, `author_recency`, and now BST vs.
+DIN), and the ceiling on how much of it any single mechanism can extract
+sits right around 0.601–0.602 no matter whether that mechanism is
+hand-crafted features, an auxiliary loss, or an attention architecture.
+**BPR FM + temporal features + watch-time (0.6017 test primary) remains
+the number to beat.**
+
+Every actively-explored direction in this project (loss function,
+temporal features, multi-task, model architecture, sequence modeling) has
+now been tested to a clear conclusion. Remaining lower-priority items from
+the README: time/drift features, unbiased validation via the
+random-exposure log.
+
+Reproduce: `.venv_gpu/bin/python sequence_model.py --arch bst --device
+cuda --seed 0` (on a GPU node) → test primary 0.6022.
+
+## 2026-08-29 — Dynamic Negative Sampling (DNS): a genuinely new axis, still a null
+
+Every BPR experiment so far (loss, temporal features, multi-task,
+watch-time, DeepFM, FinalMLP, BST) has used the *same* negative-sampling
+strategy underneath: one uniformly random negative per positive. This
+entry tests a different lever entirely — *which* negative gets shown, not
+the loss function, features, or architecture. Literature motivation: hard
+negative sampling on BPR is theoretically connected to optimizing One-way
+Partial AUC, which correlates with Top-K metrics more strongly than plain
+AUC — relevant since nDCG@5 is half our primary metric.
+
+**Implementation** (`loss='pairwise_dns'` in `baseline.py`): for each
+positive, sample `dns_n` candidate negatives from the same user's negative
+pool, score all of them with the *current* model, train on whichever one
+the model currently ranks highest (the "hardest" one). Reuses
+`FM.step_pairwise` unchanged — only the negative-selection logic differs
+from plain BPR.
+
+### Finding 1: naive hard-negative selection is actively unstable, not just unhelpful
+
+First attempt (`dns_n=8`, no warmup): loss *increased* epoch over epoch
+(0.63→0.75) and validation primary collapsed to 0.52–0.57 (vs. ~0.60
+normally) — not a marginal miss, active training instability. Diagnosed
+and fixed in two steps, both standard practice in the hard-negative-mining
+literature:
+
+1. **Warm-up** (`dns_warmup=3`): train with plain random negatives for the
+   first few epochs before switching to hardest-of-N — mining "hardest"
+   negatives against a still-randomly-initialized model chases noise, not
+   signal. This alone didn't fix it: switching to `dns_n=8` after 3 clean
+   warm-up epochs (0.6022 valid primary) still caused an *immediate,
+   monotonic decline* (0.5921→0.5945→0.5869→0.5772 over the next 4 epochs).
+2. **Learning-rate reduction on switch** (`dns_lr_decay=0.2`): hard
+   negatives make `sigmoid(z_pos - z_neg)` sit close to 0.5 on nearly every
+   step (vs. plain random negatives, which are usually already correctly
+   ranked, `sigmoid≈1`, gradient≈0) — this is effectively a large,
+   consistent increase in gradient magnitude per step, which Adam's
+   moment estimates (tuned for the *random*-negative gradient
+   distribution) aren't calibrated for. Dropping `lr` by 5x when switching
+   removed the wild divergence, but the decline **continued anyway**,
+   just more slowly (0.6553→0.6338 GAUC, 0.5289→0.5205 nDCG@5, over 4
+   epochs) — both submetrics falling *together*, not a GAUC/nDCG5
+   trade-off (which would show one rising as the other fell, the pattern
+   LambdaRank@5 showed). That rules out "sacrificing broad ranking for
+   top-K gains" as the mechanism — hard negatives here are teaching
+   something actively counterproductive on both fronts, not narrowly
+   over-focusing.
+
+**Hypothesis for why, specific to this dataset:** the negative-sampling
+literature's theoretical case for hard negatives is mostly validated on
+large-catalog settings where an unrelated item is a highly reliable true
+negative. Here, the catalog is only 7,538 videos with heavy repeat
+exposure across users (already established: `prior_exposure`'s 78.5%
+re-watch rate, `author_recency`'s near-certain re-engagement after
+same-session adjacency). In a small, repeat-heavy catalog, the "hardest"
+negative — the item the current model most confidently mis-ranks as
+positive — is disproportionately likely to be a video the user has genuine
+latent interest in but simply didn't watch long enough *this specific
+impression*, closer to label noise than a true negative. Concentrating
+training on exactly these cases plausibly teaches the model to chase
+noise in the `long_view` threshold itself rather than real preference
+structure.
+
+### Finding 2: gentler hardness (`dns_n=2`) is stable, but a clean null
+
+Reducing to `dns_n=2` (train on the better of just 2 random candidates,
+much weaker selection pressure) eliminated the instability entirely —
+validation improved steadily epoch-over-epoch (0.6049→0.6067) rather than
+declining. But the converged result is statistically indistinguishable
+from the clean baseline:
+
+| model | GAUC | nDCG@5 | primary |
+|---|---|---|---|
+| BPR FM, 7 fields (clean baseline) | 0.6689 (σ=0.0005) | 0.5326 (σ=0.0005) | 0.6008 (σ=0.0004) |
+| **DNS, `dns_n=2`, warmup=3, lr_decay=0.2** | **0.6687** (σ=0.0005) | **0.5325** (σ=0.0004) | **0.6006** (σ=0.0004) |
+
+Per-seed test primary: 0.6011, 0.6006, 0.6002, 0.6002, 0.6010. Gap = −0.0002,
+−0.73 standard errors — a clean wash, not a regression, not a gain.
+
+### Decision
+
+**Not adopted.** The theoretical case for hard negative sampling (OPAUC /
+Top-K connection) didn't translate into a practical gain here, and the
+instability at higher hardness settings is itself an informative finding:
+it's consistent with, and adds a mechanistic explanation for, this
+project's now-extensive pattern of "no exploitable structure beyond
+`user_id × video_id`" — here, the *reason* a promising technique failed
+isn't "nothing left to find," it's that harder negatives specifically
+surface a kind of noise (repeat-exposure ambiguity) baked into this
+dataset's structure, rather than genuine signal a bigger/better mechanism
+could extract. Not swept further (`dns_n` between 2 and 8, alternative
+warmup/decay schedules) given the clear, consistent direction across both
+tested settings and the diminishing-returns pattern already established
+for hyperparameter sweeps in this log (e.g. the `pairwise_watchtime`
+`aux_weight` sweep). `baseline.py`'s FM code retained (`--loss
+pairwise_dns`) as verified, working infrastructure in case revisited with
+a different sampling scheme. BPR FM + temporal features + watch-time
+(0.6017 test primary) remains the number to beat.
+
+Reproduce: `python3 baseline.py --model fm --loss pairwise_dns --dns_n 2
+--seed 0` → test primary 0.6011 (stable). `--dns_n 8` (default) reproduces
+the instability finding within a few epochs of the warmup period ending.
+
+## 2026-08-29 — Train/test temporal drift: a real structural finding, but reweighting doesn't help
+
+Investigating the README's remaining "时间特征与分布漂移" headroom item.
+Unlike previous entries (which attacked model capacity or training signal),
+this targets the **data distribution** — which training rows count, not how
+smart the model is. Nothing tried so far touches that axis.
+
+### The structural finding (real, and worth recording independently)
+
+Per-day breakdown of the timeline turned up a large, previously unnoticed
+asymmetry — not in the label rate, but in **logging volume**:
+
+| period | rows | impressions/user/day |
+|---|---|---|
+| Train, Apr 9–12 | 725k (**64% of all training data**) | **7.4** |
+| Train, Apr 18–21 | 86k | **1.1** |
+| Valid / test | ~14–21k per day | ~1.1 (matches late train) |
+
+Two-thirds of the training data comes from a high-intensity logging regime
+roughly 7x denser than the regime the model is actually evaluated in. The
+label rate drifts accordingly (train 0.337 → valid/test 0.313).
+
+Checked whether this is a population shift: **it isn't**. 91% of test users
+appear in early train, 73% in late train; unique-user counts are comparable
+(24.5k early, 19.2k late, 23.9k test). Same users, ~7x different logging
+intensity — an instrumentation/sampling change, not a different audience.
+
+**Hypothesis:** training is dominated by rows structurally unlike the
+evaluation regime; reweighting or reselecting toward the eval-matched
+regime should help.
+
+### Result: hypothesis refuted, in both hard and soft form
+
+`ablation_train_window.py`, full current-best config (7 fields + BPR +
+watch-time aux), only the training-row selection/weighting changed.
+
+**Hard truncation** (drop early high-intensity days entirely):
+
+| training window | rows kept | test primary |
+|---|---|---|
+| all (current default) | 100% | **0.6020** |
+| Apr 13 onward | 36.4% | 0.5978 |
+| Apr 16 onward | 16.7% | 0.5928 |
+| Apr 18 onward (eval-matched tail only) | 7.5% | 0.5795 |
+
+**Soft recency weighting** (keep all rows, exponentially upweight
+recent ones by sampling probability — the continuous version of the same
+idea, and the form the recency-sampling literature actually recommends):
+
+| weighting | test primary |
+|---|---|
+| uniform (current default) | **0.6020** |
+| half-life 3 days | 0.5932 |
+| half-life 7 days | 0.5996 |
+| half-life 14 days (very mild) | 0.5999 |
+
+Both families are **monotonic in the same direction**: the more the
+training distribution is tilted toward the evaluation regime, the worse the
+result — and the mildest tilt (14-day half-life, 0.5999) still doesn't
+reach uniform (0.6020). Single-seed, but the effect sizes (0.002–0.023) are
+10–50x typical seed noise (σ≈0.0004), so a full 5-seed sweep wasn't a good
+use of time; the direction is unambiguous.
+
+### Finding: data volume dominates distribution match, decisively
+
+Even "mismatched" early-period data is worth more than the distribution
+alignment gained by discarding or downweighting it. The FM's parameters are
+dominated by `user_id`/`video_id` embeddings, which need interaction volume
+per ID to estimate well — starving them to buy distributional similarity is
+a bad trade at this scale. This also explains why the *mildest* weighting
+(14-day) lands closest to uniform: it's the setting that least disturbs the
+effective sample size.
+
+Worth noting what this does **not** rule out: adding logging-intensity as an
+explicit *feature* (letting the model condition on regime rather than
+reweighting the data) was the third option sketched when this direction was
+proposed, and remains untested. Given every feature-addition experiment in
+this log has been null (static features, capacity, DeepFM, FinalMLP), and
+given intensity is a per-user-per-day quantity that's near-constant within
+a user's evaluation group — which by the README's own documented property
+contributes *nothing* to intra-user ranking unless it crosses with an
+item-side feature — the expected value looks low, but it's an honest gap.
+
+### Decision
+
+**Not adopted; current default unchanged.** The structural finding (7x
+logging-intensity shift, same user population) is genuinely interesting and
+worth recording for its own sake — it's a real property of this dataset
+that isn't documented in the README — but it does not translate into a
+usable modeling lever. BPR FM + temporal features + watch-time (0.6017 test
+primary) remains the number to beat.
+
+Reproduce: `python3 ablation_train_window.py --seeds 1` (runs both the
+uniform baseline and the three soft-weighting settings; edit `configs` in
+`__main__` to switch back to the hard-truncation variants).
+
+## 2026-08-29 — RAD-style quantile watch-time target: much better target, identical result
+
+Refining the one thing in this log that *did* work (watch-time auxiliary
+task, +0.0009) rather than opening a new direction. Motivation from
+**Relative Advantage Debiasing** (Liu et al., AAAI 2025): raw watch time is
+confounded by video duration, so instead of regressing its absolute value,
+regress its **quantile within an empirical reference distribution
+conditioned on duration group** — "was this watch long *for a video of this
+length*". Naturally outlier-robust, which should also let us drop the
+hand-tuned 10x loop-capping the current implementation needs.
+
+**Verified the premise on our data before implementing** (rather than
+assuming the paper's setting transfers):
+
+| check | value | reading |
+|---|---|---|
+| corr(log1p(play_time), long_view), global | 0.596 | baseline signal quality |
+| same, *within* duration deciles | 0.46 → 0.64 | duration genuinely confounds it — RAD's premise holds |
+| corr(log1p(duration), long_view) | 0.074 | but duration barely predicts the label directly |
+
+So the confounding RAD targets is real here, though milder than settings
+where duration strongly drives the outcome.
+
+**Implementation** (`data.watch_time_quantile_targets`, selected via
+`baseline.py --wt_target quantile`): duration split into 10 train-fitted
+groups; per-group empirical watch-time distribution built from train only
+(no leakage); each row's target is its watch time's quantile in its own
+duration group's distribution. Censoring handled identically to the
+existing implementation (completed views get `tau` = duration's quantile as
+a one-sided lower bound). Drop-in replacement — same `(t, tau, censored)`
+contract, so `step_pairwise_watchtime` is unchanged.
+
+**The new target is a much better proxy for the objective:**
+
+| target | corr with `long_view` |
+|---|---|
+| existing: capped + log1p(play_time) | 0.596 |
+| **RAD quantile** | **0.825** |
+
+### Results (test set, mean ± population std over seeds 0–4)
+
+| model | GAUC | nDCG@5 | primary |
+|---|---|---|---|
+| watch-time aux, log target (current default) | 0.6702 (σ=0.0005) | 0.5333 (σ=0.0003) | **0.6017** (σ=0.0004) |
+| **watch-time aux, RAD quantile target** | 0.6701 (σ=0.0006) | 0.5331 (σ=0.0004) | **0.6016** (σ=0.0005) |
+
+Per-seed test primary: 0.6023, 0.6020, 0.6013, 0.6014, 0.6010. Gap −0.0001
+(−0.36 standard errors) — indistinguishable.
+
+### Finding: a 39% better-correlated auxiliary target produced exactly zero ranking gain
+
+This is the most pointed version of a pattern this log has now hit from
+many angles. The auxiliary target improved substantially by its own
+measure (0.596 → 0.825 correlation with the very label being ranked), the
+implementation is cleaner (no arbitrary capping constant), the theory is
+sound and independently validated on our data — and the metric didn't move
+at all.
+
+The natural reading, consistent with everything else here: the auxiliary
+task's *contribution* was never bottlenecked on target quality. Its
+original +0.0009 came from giving the shared embeddings a denser,
+finer-grained version of the same signal `long_view` already provides
+(established in the original watch-time entry: `play_time >= 18s` alone
+predicts 96.7% of `long_view`, so it's a discretization of watch time, not
+an independent signal). Once the embeddings have absorbed that, sharpening
+*how* the auxiliary target is parameterized adds nothing — the ceiling is
+set by what the `user_id × video_id` interaction can express about this
+data, not by the fidelity of the training signal pointed at it.
+
+### Decision
+
+**Not adopted as default** — statistically identical, and the existing log
+target is already validated and in place; switching would churn the default
+for no measured gain. Kept as `--wt_target quantile` (fully working, and
+arguably the more principled implementation if anyone builds on this — it
+has no hand-tuned capping constant). Current best unchanged: BPR FM + 7
+fields + watch-time aux (log target), **0.6017 test primary**.
+
+This was the highest-expected-value item remaining from the research pass
+(the only one refining a proven-positive step rather than opening a new
+direction). With it closed, the remaining README items are `hourmin` as a
+feature (low expected value — every static-feature experiment in this log
+is null) and unbiased validation via the random-exposure log (a diagnostic,
+not a scoring lever).
+
+Reproduce: `python3 baseline.py --model fm --wt_target quantile --seed 0`
+→ test primary 0.6023.
+
+## 2026-08-29 — Revisiting ruled-out ground: ADT (null, but clarifying) + seed ensembling (small real gain)
+
+Two experiments chosen by asking what earlier entries had ruled out too
+broadly — i.e. where a *specific instantiation* failed but the underlying
+idea wasn't actually tested.
+
+### 1. Adaptive Denoising Training — the direct inverse of the failed DNS experiment
+
+ADT (Wang et al., WSDM 2021): noisy implicit-feedback interactions show
+large loss early in training, so downweight (R-CE) or drop (T-CE)
+large-loss samples. Implemented the reweighted variant as
+`--loss pairwise_adt`: `w = sigmoid(z_pos - z_neg)^beta`, so the pairs the
+model currently gets *most wrong* contribute least. `beta=0` recovers plain
+BPR. Warmup of 3 epochs before reweighting kicks in (same reasoning as
+DNS's warmup — early large loss reflects an untrained model, not noise).
+Reuses `step_pairwise`'s existing `weight` argument (built for LambdaRank),
+so no new gradient code.
+
+**Why this was worth running despite DNS having failed:** it's the exact
+opposite intervention on the same axis. The DNS entry hypothesized that
+this dataset's hard negatives are largely *label noise* (small catalog,
+heavy repeat exposure, `long_view` being a threshold on watch time so
+boundary cases are near coin-flips). If that hypothesis were right,
+systematically *downweighting* those samples should have helped.
+
+| ADT strength | pairs downweighted below 0.5 | test primary (seed 0) |
+|---|---|---|
+| none (baseline) | — | **0.6017** (5-seed mean) |
+| beta=0.25 | 0.8% | 0.6013 |
+| beta=0.5 | 8.8% | 0.6007 |
+| beta=1.0 | 30.1% | 0.6003 |
+| beta=2.0 | 39.0% | 0.5979 |
+
+Monotonic decline with denoising strength; never beats baseline at any
+setting. Trains stably throughout (unlike DNS), so this is a clean
+null/negative, not an optimization failure. No 5-seed sweep run — the
+single-seed trend is monotonic across a 4x range of beta and the largest
+setting is 0.0038 below baseline (~9x seed std), so the direction is not
+in doubt.
+
+**Combined conclusion (stronger than either experiment alone):** both
+directions on this axis have now been tested. Upweighting high-loss pairs
+(DNS) destabilizes training; downweighting them (ADT) monotonically
+degrades. High-loss pairs therefore carry *real signal the model needs*,
+not discardable noise — which **partially retracts the DNS entry's
+"hard negatives are mostly label noise" hypothesis**. That hypothesis
+explained DNS's instability plausibly, but it makes a prediction (ADT
+should help) that turns out to be false. A better reading: hard pairs are
+genuinely informative *and* genuinely hard, so concentrating on them
+destabilizes while discarding them loses signal — the useful gradient is
+spread across the full difficulty range.
+
+### 2. Seed ensembling — averaging predictions, not just metrics
+
+Every experiment in this log runs 5 seeds, but only ever averaged the
+*metrics* (to report mean±std). The models' *predictions* were never
+combined. Standard variance reduction, essentially free (the models are
+already trained), and unlike every other direction tried it doesn't
+require the data to contain more signal — it extracts existing signal more
+stably. `ablation_ensemble.py`, testing both raw-score averaging and
+groupwise-rank averaging (rank-avg is scale-invariant, often more robust
+for combining rankers).
+
+Ran 5 models first, then extended to 10 with independent seeds to check
+the result replicated rather than accepting a single favourable run:
+
+| ensemble size | raw-avg | rank-avg |
+|---|---|---|
+| 1 (single-model mean, 10 seeds) | 0.6018 ± 0.0004 | — |
+| 2 | 0.6023 | 0.6020 |
+| 3 | 0.6026 | 0.6023 |
+| 4 | 0.6028 | 0.6022 |
+| 5 | 0.6026 | 0.6023 |
+| 6–10 | 0.6022–0.6027 | 0.6023–0.6027 |
+
+**Honest estimate: +0.0007 (~1.8x single-model std)**, taking the plateau
+mean over sizes 3–10 (0.6025) rather than the peak. The extension to 10
+models was worth running: at 5 models the peak looked like 0.6028 at size
+4, but that turned out to be noise — the curve is flat from 3 models on,
+not still climbing. Two things support the gain being real despite being
+modest: it exceeds **every one of the 10 individual seeds** (max 0.6022),
+so it isn't seed cherry-picking, and both aggregation methods agree
+(rank-avg converges to the same place, slightly leading at larger sizes).
+Against that: 1.8x std is below this log's usual ~2–3x bar for a confident
+win, and it saturates almost immediately.
+
+### Decision
+
+**ADT: not adopted** (kept as `--loss pairwise_adt`, working, for the
+record). **Ensembling: real but small, and not folded into the default.**
+Reasons for not changing the default: the single-model config remains the
+honest, reproducible reference point that every other entry in this log is
+measured against, and swapping it for an N-model ensemble would make future
+comparisons harder to interpret for a gain barely above noise. It is,
+however, the **only positive result in the last nine directions tried**,
+and it is worth knowing for a final submission, where 3–5 models cost ~3s
+each and ~+0.0007 is free money.
+
+Best single-model config remains **0.6017**; best achievable number with
+ensembling on top is **~0.6025**.
+
+That ensembling is the one thing that worked fits this log's overall
+pattern precisely: every failed direction tried to extract *more signal*
+from a dataset that appears not to contain much more; ensembling doesn't
+need more signal, it just reduces variance around the signal already
+found. That is also why its ceiling is low — variance reduction cannot
+move a bias/information limit.
+
+Reproduce: `python3 ablation_ensemble.py --n_models 5` (~15s total) →
+raw-avg ensemble test primary 0.6026. `python3 baseline.py --model fm
+--loss pairwise_adt --adt_beta 1.0 --seed 0` → 0.6003.

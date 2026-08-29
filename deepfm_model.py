@@ -65,7 +65,7 @@ def _predict(model, X, device, bs=65_536):
 
 
 def run_deepfm(splits, k=16, hidden=(64, 32), dropout=0.2, lr=0.001, epochs=40, bs=8192,
-               patience=4, seed=0, device='auto', verbose=True):
+               patience=4, seed=0, device='auto', verbose=True, return_scores=False):
     device = resolve_device(device) if isinstance(device, str) else device
     enc, dim = encode(splits)
     Xtr, ytr, utr = enc['train']; Xva, yva, uva = enc['valid']; Xte, yte, ute = enc['test']
@@ -120,8 +120,11 @@ def run_deepfm(splits, k=16, hidden=(64, 32), dropout=0.2, lr=0.001, epochs=40, 
                 break
 
     model.load_state_dict(best_state)
-    return {'valid': evaluate(uva, yva, _predict(model, Xva, device)),
-            'test':  evaluate(ute, yte, _predict(model, Xte, device))}
+    sva, ste = _predict(model, Xva, device), _predict(model, Xte, device)
+    if return_scores:
+        return {'valid_scores': sva, 'test_scores': ste,
+                'valid': evaluate(uva, yva, sva), 'test': evaluate(ute, yte, ste)}
+    return {'valid': evaluate(uva, yva, sva), 'test': evaluate(ute, yte, ste)}
 
 
 if __name__ == '__main__':
