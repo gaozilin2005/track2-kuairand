@@ -1,5 +1,57 @@
 # KuaiRand-Pure Starter Kit
 
+## ⚠️ 先看这个：哪些文件属于被评分的任务
+
+赛题口径（**已按完整题面核对过**，见 `RUN_LOG.md` 2026-08-30 的口径核对记录）：
+**用户内排序** —— 对每个用户在评测集里的曝光重排，正例是 `long_view`，
+指标 **GAUC / nDCG@5**，primary = 两者平均。三个数据集变体（Pure / 1k / 27k）
+口径完全一致。
+
+| 属于评分任务 | 说明 |
+|---|---|
+| `evaluate.py` | 官方评分代码，**不要改** |
+| `data.py` / `temporal_features.py` | 数据加载与特征 |
+| `baseline.py` | FM + 各种 loss |
+| `make_submission.py` | **产出最终提交文件**（按 validation-best 选） |
+| `sequence_model.py` / `deepfm_model.py` / `finalmlp_model.py` / `lightgcn_model.py` | 试过的各种模型 |
+| `ablation_*.py` | 各项消融 |
+| `run_bonus.py` / `data_large.py` | bonus 数据集（1k / 27k），同一套任务和指标 |
+
+| ❌ **不属于**评分任务 | 说明 |
+|---|---|
+| `evaluate_retrieval.py` | 全库检索的 NDCG@10 / Recall@50 |
+| `retrieval_baseline.py` | 检索版 random / pop / BPR-MF |
+| `retrieval_lightgcn.py` | 检索版 LightGCN |
+
+这三个文件是一次**走错方向**的产物：赛题 Constraints 表的 "Limits" 行写着
+`NDCG@10 / Recall@50, click = positive`，与题面其余 8 处（含评分代码、提交 schema、
+官方 baseline 数字）矛盾。决定性证据是提交格式为"每个评测行一个分数"，
+而全库检索根本无法用这个 schema 表达。文件保留但**不参与评分**，
+完整分析见 `RUN_LOG.md`。
+
+## 资源消耗（赛题 Feasibility 项要求）
+
+| 项目 | 数值 |
+|---|---|
+| 迭代/实验条目 | `RUN_LOG.md` 21 条记录，覆盖约 35 组配置（每条常含多个 5-seed sweep） |
+| 主要基准 wall-clock | 单次 FM 训练约 30-40 秒（单核 CPU）；5-seed sweep 约 3-5 分钟 |
+| 最重的单项 | BST 在 CPU 上约 2450 秒/epoch → 改用 GPU 集群后约 22 秒/epoch（约 110 倍） |
+| Bonus 1K | 单次运行 1874 秒（31 分钟），峰值内存 2.68 GB |
+| GPU 用量 | 仅 BST 的 5 个 seed 在 SoC 集群跑过，约 15 分钟 GPU 时间；其余全部单核 CPU |
+| 硬件限制 | 本机 8 GB RAM —— 这是 27K 不可行、以及 BST 本地 OOM 的直接原因 |
+
+**人工干预次数.** 本次运行**不是全自动**。按性质分两类：
+- **任务指派**（"接下来试 X"）：约 15 次，属于正常的人类设定方向
+- **纠正 / 解阻**：约 10 次，其中影响结果的关键几次：
+  1. 放开 torch 依赖（我原本误以为 numpy-only 是硬约束）
+  2. 提供 GPU 集群访问，并协助排查 SSH / VPN / 磁盘配额（约 6 轮往返）
+  3. **对我"集成已到头"的结论提出质疑**（"I believe there is more here"）
+     —— 直接导致了本项目最好的结果（异构集成 0.6034）
+  4. **提供完整题面，纠正了我错误的任务口径转向**
+
+第 3 和第 4 条特别值得记录：一次是我过早下了否定结论，一次是我拿单行文字
+推翻了多处一致证据。两次都是人类干预纠正的，**不是 agent 自查发现的**。
+
 ## 依赖
 
 Python 3.9+ 和 numpy。**核心 baseline 没有别的。** 不需要 torch、pandas、sklearn。
