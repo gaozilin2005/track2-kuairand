@@ -119,6 +119,8 @@ if __name__ == '__main__':
                     help='只训练这一个成员并把分数存到 scores/<name>.npz（分开跑，避免同时驻留爆内存）')
     ap.add_argument('--combine', action='store_true', help='读取 scores/ 下所有成员，做融合与评估')
     ap.add_argument('--scores_dir', default='./scores')
+    ap.add_argument('--n_greedy', type=int, default=15,
+                    help='贪心加权集成的迭代轮数（每轮选一个成员，可重复选）')
     ap.add_argument('--bst_L', type=int, default=64,
                     help='BST 成员的历史窗口长度。默认 160 会把内存打爆（本机 OOM，exit 137）；'
                          '64 足够——RUN_LOG 记录 L=100 也只影响 0.18% 的行')
@@ -144,6 +146,10 @@ if __name__ == '__main__':
             from finalmlp_model import run_finalmlp
             r = run_finalmlp(splits, seed=0, device=a.device, verbose=False, return_scores=True)
             sva, ste = r['valid_scores'], r['test_scores']
+        elif name == 'lightgcn':
+            from lightgcn_model import run_lightgcn
+            r = run_lightgcn(splits, seed=0, device=a.device, verbose=False, return_scores=True)
+            sva, ste = r['valid_scores'], r['test_scores']
         elif name == 'bst':
             from sequence_model import run_seq
             r = run_seq(splits, arch='bst', seed=0, device=a.device, L=a.bst_L,
@@ -164,6 +170,7 @@ if __name__ == '__main__':
             d = np.load(os.path.join(a.scores_dir, fn))
             members[fn[:-4]] = (d['valid'], d['test'])
     names = list(members)
+    n_greedy = a.n_greedy
     print(f'loaded members: {names}')
     gva, gte = _group_index(uva), _group_index(ute)
 
@@ -201,5 +208,34 @@ if __name__ == '__main__':
     for tn, tfun in TRANSFORMS.items():
         r = evaluate(ute, yte, np.mean([tfun(members[n][1], gte) for n in names], axis=0))
         print(f'    {tn:7s}: primary {r["primary"]:.4f}')
+
+    # ---- 贪心加权集成（Caruana et al. 2004, ensemble selection with replacement）----
+    # 等权平均对弱成员太不公平：LightGCN 跟其它成员的相关只有 0.57（比 BST 的 0.89 更
+    # 互补），但它单独只有 0.5576，等权投票会把整体拖下去。带放回的贪心选择天然给出
+    # 整数权重——一个成员被选中几次就是几份权重，弱而互补的成员可以只拿一小份。
+    # 仍然只在 valid 上选，test 只在最后报一次。
+    print('\n  ---- greedy weighted ensemble (selection with replacement, on VALID) ----')
+    for tname, tf in TRANSFORMS.items():
+        tva = {n: tf(members[n][0], gva) for n in names}
+        tte = {n: tf(members[n][1], gte) for n in names}
+        counts = {n: 0 for n in names}
+        cur_va = None
+        best_hist = []
+        for step in range(n_greedy):
+            best_p, best_n = -1, None
+            for n in names:
+                cand = tva[n] if cur_va is None else (cur_va * step + tva[n]) / (step + 1)
+                p_ = evaluate(uva, yva, cand)['primary']
+                if p_ > best_p:
+                    best_p, best_n = p_, n
+            counts[best_n] += 1
+            cur_va = tva[best_n] if cur_va is None else (cur_va * step + tva[best_n]) / (step + 1)
+            best_hist.append(best_p)
+        tot = sum(counts.values())
+        wstr = ', '.join(f'{n}:{c}/{tot}' for n, c in counts.items() if c)
+        ens_te = sum(counts[n] * tte[n] for n in names) / tot
+        r = evaluate(ute, yte, ens_te)
+        print(f'    {tname:7s}: valid {best_hist[-1]:.4f} -> TEST primary {r["primary"]:.4f}  '
+              f'(GAUC {r["GAUC"]:.4f}, nDCG@5 {r["nDCG@5"]:.4f})  weights: {wstr}')
 
     print('\n  vs homogeneous seed ensemble (RUN_LOG.md): 0.6025 | single-model best 0.6017')

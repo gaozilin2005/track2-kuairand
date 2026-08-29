@@ -8,3 +8,7 @@ logs/
 .DS_Store
 scores/
 .claude/
+KuaiRand-1K/
+KuaiRand-1K.tar.gz
+KuaiRand-27K/
+KuaiRand-27K.tar.gz

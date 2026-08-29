@@ -12,22 +12,30 @@ SPLITS = {'train': (20220408, 20220421),
 # 想加静态域就往 _raw_fields 加 —— 这是学生最该动的地方之一。
 FIELDS = ['user_id', 'video_id', 'author_id', 'tab', 'dur_bucket', 'prior_exposure', 'author_recency']
 
-def load(data_dir):
-    """读日志 + 视频侧特征，返回按划分切好的 dict。"""
+def load(data_dir, suffix='pure'):
+    """读日志 + 视频侧特征，返回按划分切好的 dict。
+
+    suffix 选 'pure' / '1k' / '27k'，对应 KuaiRand 的三个变体（文件名只差这个后缀）。
+    日期划分三个变体通用（都是 4/08-5/08 这段时间的日志）。默认 'pure' 保持
+    原有行为不变——RUN_LOG.md 里所有实验都是在这个默认值下跑的。"""
     vid2author = {}
-    with open(os.path.join(data_dir, 'video_features_basic_pure.csv')) as fh:
+    with open(os.path.join(data_dir, f'video_features_basic_{suffix}.csv')) as fh:
         for r in csv.DictReader(fh):
             vid2author[r['video_id']] = r['author_id']
 
     rows = []
-    for f in ('log_standard_4_08_to_4_21_pure.csv', 'log_standard_4_22_to_5_08_pure.csv'):
+    for f in (f'log_standard_4_08_to_4_21_{suffix}.csv',
+              f'log_standard_4_22_to_5_08_{suffix}.csv'):
         with open(os.path.join(data_dir, f)) as fh:
             for r in csv.DictReader(fh):
                 rows.append((int(r['date']), r['user_id'], r['video_id'],
                              vid2author.get(r['video_id'], 'UNK'), r['tab'],
                              float(r['duration_ms']), 1 if r[LABEL] != '0' else 0,
                              int(r['time_ms']), 1 if r['is_click'] != '0' else 0,
-                             float(r['play_time_ms'])))
+                             float(r['play_time_ms']),
+                             1 if any(r[k] != '0' for k in
+                                      ('is_like', 'is_follow', 'is_comment',
+                                       'is_forward', 'is_profile_enter')) else 0))
 
     out = {}
     for name, (lo, hi) in SPLITS.items():

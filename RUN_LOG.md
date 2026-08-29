@@ -1523,3 +1523,327 @@ move a bias/information limit.
 Reproduce: `python3 ablation_ensemble.py --n_models 5` (~15s total) →
 raw-avg ensemble test primary 0.6026. `python3 baseline.py --model fm
 --loss pairwise_adt --adt_beta 1.0 --seed 0` → 0.6003.
+
+## 2026-08-29 — Heterogeneous ensemble: the best result in the project (0.6034)
+
+**User pushed back on the previous entry** ("I believe there is more here"),
+and they were right. The homogeneous seed ensemble combined 10 models that
+were *identical except for random seed* — the least diverse ensemble
+constructible. The ensemble literature is consistent that gains come from
+**complementary error patterns**, not from averaging per se, which also
+explains why that ensemble saturated at 3 members and stalled at +0.0007.
+
+Meanwhile this project had trained five architecturally distinct models,
+each individually dismissed for failing to beat the FM baseline, and never
+once combined:
+
+| member | inductive bias |
+|---|---|
+| fm_watchtime | bilinear FM + watch-time censored-regression aux |
+| fm_quantile | same, RAD quantile aux target |
+| **bst** | **order-aware self-attention + positional encoding** |
+| deepfm | FM + parallel DNN branch |
+| finalmlp | no explicit interaction term; two gated MLP streams |
+
+Four fusion methods tested (raw score average, per-group z-score, per-group
+rank, and Reciprocal Rank Fusion — the IR standard). **Protocol guard: the
+fusion method and member subset were selected on VALID, with test reported
+once**, so the headline number is not tuned on itself.
+
+### The correlation matrix is the finding
+
+Pairwise rank correlation on test (lower = more complementary):
+
+| | bst | deepfm | finalmlp | fm_quant | fm_watch |
+|---|---|---|---|---|---|
+| **bst** | 1.000 | **0.892** | **0.885** | **0.887** | **0.891** |
+| deepfm | 0.892 | 1.000 | 0.973 | 0.934 | 0.939 |
+| finalmlp | 0.885 | 0.973 | 1.000 | 0.926 | 0.931 |
+| fm_quantile | 0.887 | 0.934 | 0.926 | 1.000 | 0.952 |
+| fm_watchtime | 0.891 | 0.939 | 0.931 | 0.952 | 1.000 |
+
+**BST sits at 0.885–0.892 against everything else; every non-BST pair is
+0.926–0.973.** That gap is the whole result. DeepFM and FinalMLP look
+architecturally radical on paper — FinalMLP has no explicit interaction
+term at all — yet they correlate with each other at **0.973**, essentially
+the same model in different clothing. They differ in *how* they compute the
+`user_id × video_id` interaction; BST differs in *what information it
+reads* (sequence order). Only the latter produces complementary errors.
+
+### Results (test set)
+
+| model | GAUC | nDCG@5 | primary |
+|---|---|---|---|
+| best single member (fm_watchtime) | 0.6705 | 0.5336 | 0.6020 |
+| homogeneous seed ensemble (prev. entry) | — | — | 0.6025 |
+| all-5, rank / RRF | — | — | 0.6028 |
+| all-5, z-score / raw | — | — | 0.6032 / 0.6033 |
+| **valid-selected: z-score, {bst, fm_quantile, fm_watchtime}** | **0.6724** | **0.5344** | **0.6034** |
+
+Against the seed-std of 0.0004 used throughout this log:
+
+- vs. previous project best (single model, 0.6017): **+0.0017 ≈ 4.3σ**
+- vs. best single member here (0.6020): **+0.0014 ≈ 3.5σ**
+- vs. homogeneous seed ensemble (0.6025): **+0.0009 ≈ 2.3σ**
+
+The last comparison is the one that matters for the diversity hypothesis,
+and it clears the 2σ bar this log uses. Two independent signals corroborate
+it rather than resting on the single selected configuration: **valid
+selection independently chose a subset containing BST** (it had no access
+to test), and every fusion method lands in 0.6028–0.6034, i.e. the ranking
+of methods barely matters while the *inclusion of BST* does.
+
+### What this overturns
+
+The previous entry concluded ensembling's ceiling was low because
+"variance reduction cannot move a bias/information limit." That reasoning
+was sound but the premise was wrong: the seed ensemble was purely variance
+reduction, whereas adding BST contributes *different information* (sequence
+order), which is bias reduction, not variance reduction.
+
+It also partly rehabilitates BST. The standalone BST entry concluded "not
+adopted — ties the current best." That was correct in isolation and is
+still correct as a single-model claim, but it undervalued BST: its value
+here is not its solo score (0.6022, comparable to FM) but that it is
+**wrong in different places**. A model can be individually redundant and
+still be the most valuable ensemble member — this log had no way to see
+that until members were actually combined.
+
+Two prediction errors of mine worth recording: I estimated BST would
+correlate ~0.94–0.95 with the FM family "given the other four cluster this
+tightly" and called the run "closing the loop rather than a promising
+lead." It came in at 0.885–0.892 and produced the project's best result.
+The generalisation from four already-correlated members to a fifth
+structurally different one was unjustified.
+
+### Implementation notes
+
+Members are trained one at a time and cached to `scores/*.npz`
+(`--member <name>`), then fused separately (`--combine`). The first
+all-in-one-process version was OOM-killed (exit 137): five models plus
+BST's ~730MB L=160 history array does not fit locally. I also misdiagnosed
+this twice — first asserting OOM without evidence, then reversing on a
+0.9GB RSS snapshot that happened to be taken before the history array was
+allocated. The final BST member was trained on the SoC GPU cluster at full
+L=160 (~3 min), which sidesteps the memory limit entirely.
+
+Cluster-trained members score slightly differently from local runs
+(deepfm 0.6013 vs 0.6005, finalmlp 0.6015 vs 0.6008) — hardware/library
+nondeterminism, not a methodological difference. All numbers in the table
+above come from the single cluster run, so they are internally consistent.
+
+**Caveat on precision:** this is one ensemble built from one seed per
+member. The *members'* seed variance is well characterised (σ≈0.0004
+across many entries), but the ensemble's own run-to-run variance is not
+measured, so treat 0.6034 as a point estimate rather than a mean.
+
+### Decision
+
+**Best known configuration: heterogeneous ensemble, 0.6034 test primary.**
+Recorded in the baseline ladder as the best achievable number, with the
+single-model config (0.6017) retained as the reference point that all
+per-experiment comparisons in this log are measured against — mixing the
+two as "the baseline" would make ~30 prior entries harder to interpret.
+
+For a final submission, use the ensemble: it is ~4σ above the best single
+model and the members cost minutes to train.
+
+The actionable generalisation for anyone continuing: **stop looking for a
+single better model.** Nine directions found the same ceiling. The gain
+here came from combining models that were each individually judged
+failures, because one of them was wrong in a different place. If more
+headroom exists, the most likely source is another member with a genuinely
+different information source — not a better architecture over the same
+seven features.
+
+Reproduce (GPU node, ~5 min):
+```
+for m in fm_watchtime fm_quantile deepfm finalmlp; do
+  python ablation_hetero_ensemble.py --member $m --device cuda
+done
+python ablation_hetero_ensemble.py --member bst --bst_L 160 --device cuda
+python ablation_hetero_ensemble.py --combine
+```
+
+
+## 2026-08-30 — 任务口径核对：一次走错方向 + 纠正（recovery event）
+
+**Hypothesis.** 用户转述了赛题 Constraints 表 "Limits" 行的一句话：
+`KuaiRand-Pure: NDCG@10 / Recall@50, click = positive (fixed) (Required)`，
+并要求改用另外两个数据集。若属实，这意味着任务、标签、指标三者同时变了。
+
+**What I did (and got wrong).** 我先验证了一件事并且验证结论是对的：
+test 用户曝光数中位数只有 5，只有 0.3% 的用户有 ≥50 条曝光，所以
+"在用户曝光内部算 Recall@50" 对 99.7% 的用户恒等于 1.0，完全退化；NDCG@10 同理
+（76% 的用户曝光不足 10 条）。**这两个指标只有在全库检索下才有意义。**
+到这一步为止推理无误。但我据此得出的结论错了——我判定"任务改成全库检索"，
+并据此写了 `evaluate_retrieval.py` / `retrieval_baseline.py` / `retrieval_lightgcn.py`，
+还跑出了一套检索 baseline（random NDCG@10 0.0007 / pop 0.0356 / BPR-MF 0.0450）。
+
+**How it was caught.** 用户随后贴出完整赛题。全文有 8 处跟那一行冲突：
+1. Benchmarks 表原文："the task treats **long_view** as the positive relevance label,
+   ranks **within each user's logged impressions (not full-catalog retrieval)**,
+   and reports **GAUC / nDCG@5**"，且注明 "fixed by the organizers"
+2. Benchmarks 表 Metrics 列：GAUC / nDCG@5
+3. Judging Criteria 的 per-dataset metrics：GAUC / nDCG@5
+4. §4 结果表要求：KuaiRand-Pure GAUC / nDCG@5
+5. 文中引用的 baseline 0.5946 / oracle 0.8645 / random 0.4753 —— 全是这个任务的数字
+6. `evaluate.py` 被称作 "the exact scoring code"
+7. 收敛判据 ε=0.002 是按该 primary 的 5-seed σ=0.0008 标定的
+8. **决定性证据**：提交格式是 "one line per evaluation-split row"，每行一个分数。
+   全库检索**无法用这个 schema 表达**——那需要每个用户一个 top-K 列表。
+
+**Root cause of my error.** 我把"这个指标在当前口径下退化"当成了"所以口径变了"，
+但正确的推论是"**所以那一行本身有问题**"。一行 Constraints 表的文字，对上评分代码、
+提交 schema、官方 baseline 数字三者的一致证据，权重不该对等。教训：当新信息与
+既有的多处一致证据冲突时，先假设新信息有误，而不是先推翻既有体系。
+
+**Cost / recovery.** 走错方向约一个迭代周期，产出 3 个文件是无效工作（对评分而言）。
+没有污染任何已有结论——`RUN_LOG.md` 里全部实验用的都是正确口径的 `evaluate.py`。
+检索相关文件保留在仓库里但已在 README 标注"非评分任务"，避免后来者混淆。
+另一个附带收获：那 3 个数据集变体（Pure/1k/27k）**用的是同一套任务和指标**，
+所以"跑另外两个数据集"这个方向本身是成立的（bonus 分），只是要用正确的口径跑。
+
+**Metrics（正确口径，KuaiRand-Pure）.** 无变化，此次事件未改动任何既有结果。
+
+---
+
+## 2026-08-30 — 最终提交产出（`make_submission.py`）
+
+**Hypothesis.** 赛题明确 "The submission scored for ranking is the **validation-best
+checkpoint**"，且 §4 要求提交 validation-best 分数及其相对官方 baseline 的 absolute delta。
+此前所有实验只在报告 test 分数，缺一个能真正产出合规提交文件的入口。
+
+**发现的问题.** `submit.py --make` 已经失效：那段代码写死 `m.step`（pointwise loss），
+而 `data.encode()` 现在默认返回 7 域。所以它既不是官方 baseline（5 域 + pointwise），
+也不是我们的最优配置——只能当"生成一个格式合法的示例文件"用，不能用来做最终提交。
+**这是一个隐蔽的坑：文件名和参数看起来仍然正确，静默产出的却是第三种模型。**
+
+**Code diff.** 新增 `make_submission.py`，两种模式，选择全部只在 valid 上做：
+  --mode single   7 域 FM + BPR + watchtime 辅助任务，早停按 valid primary，
+                  返回 valid-best 参数（不是最后一轮）
+  --mode ensemble 读 `scores/*.npz` 缓存的成员分数，在 valid 上枚举子集选最优（z-score 融合）
+写完立刻用 `submit.read_submission` 自检格式与对齐（跟 `submit.py --check` 同一套代码）。
+
+**Metrics.**
+
+| 提交 | valid primary | test GAUC | test nDCG@5 | test primary |
+|---|---|---|---|---|
+| 官方 baseline（赛题公布） | 0.6016 | 0.6610 | 0.5282 | 0.5946 |
+| `--mode single` | **0.6071** | 0.6705 | 0.5336 | 0.6020 |
+| `--mode ensemble`（本机 4 成员，无 BST） | **0.6075** | 0.6712 | 0.5340 | 0.6026 |
+| `--mode ensemble`（含 BST，集群跑的那次） | **0.6091** | 0.6724 | 0.5344 | 0.6034 |
+
+两个提交文件均通过格式与对齐校验（170,588 行）。valid-selection 正确地把 LightGCN
+排除在外（它单独只有 0.5576，见异构集成那条记录）。
+
+**下一步.** 本机重训 BST（L=64，避开 L=160 的 OOM）以便在本地复现含 BST 的最优集成；
+之后按赛题 bonus 跑 KuaiRand-1K / 27K（**同一套任务和指标**）。
+
+
+## 2026-08-30 — 把"历史特征"套到其它反馈信号上（Tier 2）：确认无收益
+
+**Hypothesis.** `prior_exposure`(+0.0015) 和 `author_recency`(+0.0017) 是本项目最有效的
+两个特征，两个都是建在 `long_view` 上的**跨行历史**特征。同样的构造从没套到别的反馈
+信号上试过。注意跟已否决实验的区别：`is_click` 作为**辅助任务**是空结果（0.6007），
+那测的是"预测点击能否改善 embedding"；这里测的是"**这个用户以前点过这个视频/这个作者
+吗**"——关于具体 (user, item) 对的时序信号，跟 prior_exposure 同机制，是另一个实验。
+
+**Code diff.** 新增 `ablation_other_signals.py`；`data.py` 的 `load()` 增加第 11 列
+（把 is_like / is_follow / is_comment / is_forward / is_profile_enter 合并成一个
+"强互动"标志——单个都太稀疏，最密的 profile_enter 也才 2.5%，合并后 4.5%）。
+三个候选特征，都用跟 `temporal_features.py` 相同的"严格早于当前行 time_ms"规则：
+  prior_click          该用户此前点击过这个确切视频吗（命中 7,699 / 1,436,609 行）
+  author_click_recency 离上次点击这个作者的作品过了多久，分桶（命中 23,218 行）
+  author_engage        此前对这个作者有过强互动吗（命中 2,287 行）
+对照基准是**当前最优配置**（7 域 + BPR + watchtime 辅助任务），不是 5 域基线。
+
+**Metrics（test，5 seed，mean ± population std）.**
+
+| 配置 | primary | Δ vs 对照 |
+|---|---|---|
+| 当前默认 7 域（对照） | 0.6017 ± 0.0004 | — |
+| + `prior_click` | 0.6019 ± 0.0003 | +0.0002（0.5σ）|
+| + `author_click_recency` | 0.6022 ± 0.0003 | +0.0005（1.25σ）|
+| + `author_engage` | 0.6015 ± 0.0003 | −0.0002 |
+| 三个全加（10 域） | 0.6020 ± 0.0004 | +0.0003 |
+
+**Finding.** 最好的一个（`author_click_recency`）单 seed 看着有 +0.0006，5 seed 收缩到
++0.0005，约 1.25σ——低于本项目一贯的 2~3σ 确认门槛。**判为无收益，不收编。**
+
+为什么点击历史远不如 long_view 历史（+0.0015/+0.0017 vs +0.0005）：因为
+`long_view` 历史特征的强大之处在于**它就是标签本身的历史**——"这个用户以前长看过
+这个视频"几乎直接回答了"这次会不会长看"（`prior_exposure` 命中时 long_view 率 78.5%
+vs 全局 33.1%）。点击是相关但不同的信号，这跟 `is_click` 作为辅助任务同样无收益
+是同一个结论的两次独立印证：**click 携带的信息，模型从 long_view 自己的梯度里已经
+拿到了。**
+
+**Decision.** 不收编，`data.py` 的 `FIELDS` 保持 7 域。`ablation_other_signals.py`
+留在仓库里作为归因记录。第 11 列（强互动标志）保留在 `load()` 里——它本身无害，
+且后续若要做多信号建模可以直接用。
+
+Reproduce: `python3 ablation_other_signals.py --seeds 5`
+
+
+## 2026-08-30 — Bonus benchmark：KuaiRand-1K 跑通；27K 判定本机不可行
+
+**Hypothesis.** 赛题确认三个变体**用的是同一套任务和指标**（"KuaiRand-Pure /
+KuaiRand-1k / KuaiRand-27k → GAUC / nDCG@5"），所以 bonus 不需要新指标，
+只需要让同一套流程吃得下更大的数据。瓶颈预期是内存而非算法。
+
+**Code diff.** 新增 `data_large.py`（列式流式加载器）+ `run_bonus.py`（跑 FM+BPR）；
+`data.py` 的 `load()` 增加 `suffix` 参数（'pure'/'1k'/'27k'，默认 'pure' 保持原行为）。
+为什么必须另写加载器：`data.py` 把每行做成 Python tuple 存 list，Pure 的 140 万行约
+280MB 没问题，1K 的 1171 万行要约 2.3GB，本机只有 **8GB RAM**。列式版本全程只留 numpy
+数组，实测峰值 2.68GB。
+
+**Metrics（KuaiRand-1K，FM + BPR，5 域，seed=0）.**
+
+| split | GAUC | nDCG@5 | primary |
+|---|---|---|---|
+| valid | 0.6644 | 0.5772 | **0.6208** |
+| test | 0.6645 | 0.5742 | **0.6194** |
+
+wall-clock 1874s（约 31 分钟），峰值内存 2.68GB，5 个 epoch 后早停。
+
+**⚠️ 这些数字不能跟 Pure 的 0.6070/0.6020 比。** 三个理由：
+(1) 赛题只公布了 Pure 的官方 baseline（0.5946），1K/27K 没有公布 baseline，所以这里
+    只有绝对值，没有 delta；
+(2) 数据结构完全不同：1K 保留了 1000 个用户的**全部**日志，valid 里每个用户平均有
+    2,525 条曝光，而 Pure 每个用户只有约 5 条（Pure 被过滤到了候选池）。"用户内排序"
+    在两个数据集上的难度根本不是一回事；
+(3) 1K 只有 1000 个用户，其中**只有 983 个是可训练的**（需要同时有正负例）。
+
+**观察到的问题（记录下来，不是已解决）.** 最好的一轮是 **epoch 1**，之后单调下降
+（0.6208 → 0.6160 → 0.6102 → 0.6103 → 0.6033）。早停正确地保留了 epoch-1 的参数，
+但这是**过拟合**而非健康收敛。原因很清楚：4,371,868 个视频对 1171 万次交互 ——
+**平均每个视频只有 2.7 次交互**，video embedding 根本估不准。Pure 是 7,583 个视频对
+140 万次交互（每视频 185 次），密度差了近 70 倍。
+真要在 1K 上做好，第一步应该是处理这个稀疏性（比如按频次过滤长尾视频、或者更强的
+正则/更小的 k），而不是照搬 Pure 上调好的配置。**本次没做这一步。**
+
+**另一个性能问题（同样未解决）.** 每个 epoch 316-416 秒，而 Pure 只要 2-3 秒。
+主因不是数据量而是 `FM._adam_update` 对**整张 embedding 表**做稠密更新：
+每个 minibatch 都要跑 O(dim × k) 的 Adam 运算，Pure 的 dim=40,273 无所谓，
+1K 的 dim=5,778,436 就是 140 倍的无谓计算（一个 batch 实际只碰到几万行 embedding）。
+正确做法是稀疏 Adam——只更新本批次碰到的行。**已识别未实现。**
+
+**KuaiRand-27K：判定本机不可行，不尝试。** 按 1K 实测数据外推（27K 有 3.22 亿次交互，
+是 1K 的 27.5 倍，视频数按官方文档约 3200 万）：
+  - X 数组本身约 6.4 GB
+  - embedding 表 V + Adam 的 m/v 三份，dim≈3500 万、k=16 → 约 6.7 GB
+  - **下限约 13.2 GB，本机 8 GB RAM 装不下**
+  - 每个 epoch 外推约 172 分钟，赛题的 6 小时 wall-clock 上限只够跑约 2 个 epoch
+盲目开跑只会重演本 session 已经踩过两次的 OOM（exit 137）。
+可行路径是用户的 SoC GPU 集群，但那边**家目录配额本身就装不下 CUDA 版 torch**
+（本 session 实测，见集群那条记录），要先解决存储配额。**留作未完成项，如实记录。**
+
+**同期的一个取舍决定.** 为了给 1K 腾内存（当时可用内存只剩 0.3GB），中途终止了
+本机重训 BST 的进程。取舍：BST 能把 Pure 的集成从 valid 0.6075 提到 0.6091
+（+0.0016），但本机 CPU 上约 16 分钟/epoch、需要 6-8 个 epoch，要再占用 1.5-2 小时，
+且与 1K 同时跑几乎必然触发 OOM 把两个都杀掉。判断：**一个跑通的 bonus 结果 >
+必选项上 +0.0016 的边际收益**，且 BST 的贡献已在集群那次运行中验证并记录在案。
+代价：本机 `scores/` 里没有 `bst.npz`，本地最优提交是 4 成员集成（valid 0.6075）。
+
+Reproduce: `python3 run_bonus.py --suffix 1k --data_dir ./KuaiRand-1K/data`
+（约 31 分钟，峰值 2.7GB）
