@@ -1,0 +1,1019 @@
+# Run Log
+
+Every entry: what changed, exact command, seeds 0–4, test-set mean ± std, verdict.
+Convergence rule and eval are the ones fixed in `evaluate.py` / `README.md` — never touched.
+
+## 2026-08-27 — Loss function ablation on FM
+
+Baseline: FM w/ pointwise logloss (official baseline, `baseline_scores.json`).
+Hypothesis (README "从哪里开始改" #1): pointwise optimizes calibration, but the
+metric (GAUC/nDCG@5) is a ranking metric — aligning the loss with the metric
+should help. Tested three alternatives, holding data, features (`FIELDS`),
+model (`k=16, lr=0.001, bs=8192, max_epochs=40, patience=4`), split, and eval
+fixed. Only `--loss` changes.
+
+Command shape: `python3 baseline.py --model fm --loss <X> --seed <0..4>`
+
+### Results (test set, mean ± population std over seeds 0–4)
+
+| loss | GAUC | nDCG@5 | primary | Δ vs. pointwise |
+|---|---|---|---|---|
+| pointwise (official) | 0.6610 (σ=0.0008) | 0.5282 (σ=0.0008) | 0.5946 (σ=0.0008) | — |
+| **pairwise / BPR** | **0.6638** (σ=0.0007) | **0.5304** (σ=0.0004) | **0.5971** (σ=0.0005) | **+0.0025** |
+| listwise (softmax over user's group) | 0.6583 (σ=0.0004) | 0.5279 (σ=0.0005) | 0.5931 (σ=0.0005) | −0.0015 |
+| lambdarank@5 (BPR × \|ΔnDCG@5\|) | 0.6525 (σ=0.0010) | 0.5257 (σ=0.0005) | 0.5891 (σ=0.0006) | −0.0055 |
+
+Per-seed test primary:
+- BPR: 0.5978, 0.5974, 0.5963, 0.5972, 0.5969
+- listwise: 0.5937, 0.5926, 0.5926, 0.5935, 0.5930
+- lambdarank@5: 0.5888, 0.5887, 0.5895, 0.5901, 0.5883
+
+### Finding 1 (positive): BPR beats pointwise, and the gap is real
+
++0.0025 on primary, ~3× the larger of the two σs (0.0008), and BPR's full
+5-seed range (0.5963–0.5978) never overlaps pointwise's expected range
+(≈0.593–0.596 at ±2σ). Clears the repo's own convergence bar (ε=0.002, ~2.5σ).
+**BPR is the new best result: 0.5971 primary on test, replacing pointwise FM
+(0.5946) as the number to beat.**
+
+Implementation: one negative sampled per positive, per epoch, restricted to
+users with `0 < positives < total` (same eligibility as GAUC) — pairs only
+formed within a user's own impressions, consistent with the intra-user
+ranking task definition. See `FM.step_pairwise` / `run_fm(..., loss='pairwise')`
+in `baseline.py`.
+
+### Finding 2 (negative): listwise softmax underperforms pointwise
+
+−0.0015 on primary, consistent and negative across all 5 seeds — not noise
+(gap is ~2–3× listwise's own σ). Converges in ~2 epochs then degrades;
+early stopping catches it before it gets worse, not before it gets better.
+Likely cause: the softmax-over-full-group objective distributes gradient
+mass across *all* of a user's positives equally, with no notion of "top-5" —
+mismatched with what nDCG@5 actually rewards. Not pursued further.
+
+### Finding 3 (negative): LambdaRank@5 underperforms both BPR and pointwise — on both metrics
+
+Hypothesis going in was that truncating BPR's gradient to pairs that matter
+for nDCG@5 (weight = `|ΔnDCG@5| / IDCG@5`, computed from each item's rank in
+its user's group under the current model, recomputed once per epoch) would
+trade some GAUC for nDCG@5 gain, net effect uncertain. That's not what
+happened: **it loses on GAUC (0.6525 vs BPR's 0.6638) and on nDCG@5 (0.5257
+vs BPR's 0.5304) simultaneously.** Not a trade-off — strictly worse.
+
+Root cause, from the per-epoch diagnostic (`zero_frac` printed during
+training): **~78% of sampled pairs get zero weight** every epoch, because
+both the sampled positive and negative already sit outside the top-5 by the
+current model's ranking. Effective gradient signal per epoch is roughly a
+fifth of plain BPR's. Consequence: convergence takes ~18 epochs instead of
+BPR's ~11, and lands at a worse optimum, not just a shifted one — this is
+underfitting from signal starvation, not the GAUC/nDCG5 trade-off that was
+hypothesized.
+
+Known limitation in this implementation: ranks used for the lambda weight
+are computed once at the start of each epoch (one extra forward pass over
+train), not after every gradient step, to avoid re-scoring and re-sorting
+every user's group at every minibatch. This introduces staleness within an
+epoch. Given the effect size here (signal starvation, not a marginal miss),
+per-step rank recomputation is very unlikely to close a 0.008 gap on primary
+and was judged not worth the added engineering/runtime cost. Not pursued
+further.
+
+### Decision
+
+**BPR is the loss going forward — set as `baseline.py`'s default (`--loss pairwise`)
+as of this entry.** `python3 baseline.py --model fm` now reproduces 0.5971 primary;
+pass `--loss pointwise` explicitly to reproduce the original documented FM baseline
+(0.5946, `baseline_scores.json`). README updated to match (baseline ladder table,
+run section, "从哪里开始改" — loss function moved from unexplored to tested).
+
+LambdaRank@5 was a reasonable next step
+given the metric-alignment hypothesis that motivated trying BPR in the first
+place, but the data says the truncation cost (78% dead pairs) outweighs any
+top-5-specific benefit at this model capacity/data scale. Remaining time
+goes to sequence modeling (README "从哪里开始改" #2) — still the larger
+identified headroom, and structurally unexplored (current features use zero
+behavioral history per the ablation results already on record).
+
+Reproduce: `python3 baseline.py --model fm --loss pairwise` (default seed 0,
+40 epochs w/ patience 4) → test primary 0.5978.
+
+## 2026-08-28 — DIN-style user history attention on top of BPR FM
+
+Baseline: BPR FM, the current best (0.5971 test primary, previous entry).
+Hypothesis (README "从哪里开始改" #1, this repo's own top-ranked unexplored
+item): the model has zero access to behavioral history — `FIELDS` are all
+static per-impression categoricals — despite users averaging dozens of
+`long_view=1` events each in train. A DIN-style attention layer, computing a
+per-candidate "interest vector" from a user's own history and folding it
+into the FM interaction as a 6th field, was expected to be the largest
+remaining headroom.
+
+**New dependency: PyTorch** (CPU wheel, installed into a local `.venv/`,
+`import torch` isolated entirely to the new `sequence_model.py` — the
+existing `baseline.py` numpy FM/BPR/listwise/LambdaRank code is untouched).
+Chosen over full frameworks (RecBole/TorchRec/LightGBM) after checking what
+was actually installed (nothing beyond numpy) — RecBole's data/eval
+abstractions don't match this repo's fixed, unusual GAUC/nDCG@5 contract
+closely enough to be worth the integration cost and its pandas dependency;
+plain PyTorch integrates directly with the already-tested `data.py`/
+`evaluate.py`/BPR-sampling infrastructure.
+
+**Architecture** (`sequence.py` for the numpy-only history builder,
+`sequence_model.py` for the torch model — see file docstrings for the full
+derivation): last `L=160` `long_view=1` items per user, strictly before the
+current row's `time_ms` (verified: 6.9% of rows have zero prior history —
+new users, or too early in a user's own timeline to have any yet). DIN local
+activation unit (`concat[hist,cand,hist−cand,hist×cand]` → `Linear→PReLU→
+Linear` → softmax over history, masked so an all-padding row gives an exact
+zero vector, not softmax's default uniform-over-garbage) produces
+`e_interest`, folded into the FM interaction via the same bilinear identity
+as the 5 static fields (`inter_full = inter_static + S·e_interest`, since
+the `‖e_interest‖²` term cancels exactly when expanding `(S+e_interest)²`).
+History embeddings share the same table as the static `video_id` field.
+Trained under BPR — same pos/neg sampling as `baseline.py`'s pairwise loss,
+reused verbatim, only the score function changed.
+
+**Verification before the real run** (torch autograd removes the need for
+hand-derived gradient checks, but the masking logic is still hand-written):
+a synthetic all-padded-history batch was confirmed to produce `e_interest`
+of exactly zero (matching `z0`, the static-only score, to `atol=1e-6`) and
+no NaN; a mixed-padding batch confirmed the PAD embedding row's gradient is
+exactly zero after `backward()`. Both passed before touching real data.
+
+**Bug caught during the first real-data run, fixed before the logged
+result:** `_predict`'s default batch size (200,000, copied from
+`baseline.py`'s plain-FM `predict`) doesn't actually bound memory here —
+at `L=160`, one batch's attention step materializes a `(batch, L, 4k)`
+tensor, so a 125K-row validation batch tried to allocate >5GB in one shot,
+every epoch. Symptom was silent, not a crash: epoch times escalated
+156s → 511s → 4844s under memory pressure rather than erroring. Fixed by
+capping `_predict`'s batch size at 8192 (matching the training batch size);
+confirmed identical loss/metric trajectory before and after the fix (same
+seed reproduces the same numbers) — it was purely a performance bug, not a
+correctness one — and epoch time stabilized to a flat ~70s.
+
+Command: `.venv/bin/python sequence_model.py --seed <0..4>` (torch lives only
+in the local venv, not the system Python — see README). Defaults: `k=16,
+hidden=32, L=160, lr=0.001`, 40 epochs, patience 4 — same convergence rule
+and same `k`/`lr`/batch size as the FM baseline for comparability).
+
+### Results (test set, mean ± population std over seeds 0–4)
+
+| model | GAUC | nDCG@5 | primary | Δ vs. BPR FM |
+|---|---|---|---|---|
+| BPR FM (no sequence, previous entry) | 0.6638 (σ=0.0007) | 0.5304 (σ=0.0004) | 0.5971 (σ=0.0005) | — |
+| BPR FM + DIN attention | 0.6634 (σ=0.0005) | 0.5299 (σ=0.0006) | 0.5967 (σ=0.0005) | **−0.0004** |
+
+Per-seed test primary: 0.5965, 0.5972, 0.5962, 0.5961, 0.5973 (range 0.5961–0.5973).
+Epochs to convergence: 11, 10, 10, 13, 10 — essentially the same speed as
+plain BPR FM's ~11.
+
+### Finding (negative, but tight — not a bug, not noise): no detectable gain from user history
+
+−0.0004 on primary, smaller than either model's own σ (0.0005) — statistically
+indistinguishable from zero effect, not a regression either. All 5 seeds
+land in a 0.0012-wide band, none coming close to beating BPR FM's own
+5-seed range (0.5963–0.5978, previous entry) by any meaningful margin. This
+reads as a genuine null result on a correctly-implemented pipeline (the
+masking/gradient smoke tests passed before this run; the escalating-time bug
+above was a performance issue with byte-identical loss curves before and
+after the fix, not a correctness issue).
+
+**Hypothesis for why the largest expected headroom produced nothing:**
+KuaiRand-Pure's item catalog is small — 7,538 unique videos against 26,210
+train users, each averaging dozens of interactions over two weeks. The
+earlier feature-ablation findings already established that `user_id ×
+video_id`'s FM cross term "吃掉了大部分可学的信号" (absorbs most of the
+learnable signal) at this scale — that a user liked a *specific* video
+before is largely already recoverable from the direct `user_id × video_id`
+interaction once it's been seen enough times in training, leaving less for
+a candidate-conditioned attention layer to add. This is consistent with,
+not contradictory to, the earlier capacity-ablation finding (`k=8/16/32`
+barely moving the score) — both point the same direction: at this data
+scale, the bottleneck isn't model expressiveness (static-field capacity or
+a richer scoring function), it's how much genuinely new *information*
+static IDs plus recent-history IDs can carry beyond what's already encoded.
+DIN's real-world wins are typically reported on catalogs orders of
+magnitude larger, where a user's specific history genuinely disambiguates
+among many more plausible candidates than 7,538 items allow here.
+
+**Not yet ruled out, flagged rather than chased:** no hyperparameter tuning
+was done for the new architecture (`hidden=32`, `lr=0.001` — the latter
+copied from the FM baseline, not tuned for the attention MLP specifically);
+history source was `long_view=1` only, not `is_click` (denser: median 14 vs
+10 per user) or a multi-signal history. Given the effect size sits inside
+noise and the capacity-ablation precedent suggests tuning capacity alone
+rarely moves this dataset's ceiling, further tuning was judged unlikely to
+be worth chasing without a stronger prior reason to expect it would — but
+this wasn't exhaustively tested, unlike LambdaRank@5's root cause above
+(78% dead pairs) which had a clear, confirmed mechanism.
+
+### Decision
+
+Sequence modeling, as implemented, does not beat BPR FM. **BPR FM
+(`baseline.py`, `--loss pairwise`, 0.5971 test primary) remains the number
+to beat.** `sequence_model.py` is kept in the repo (correct, verified,
+reusable infrastructure — `sequence.py`'s history builder and the
+DIN/FM-folding math are the expensive, correctness-sensitive parts, and
+both are validated) in case a future direction wants to build on it, but is
+not adopted as the new default. README's "从哪里开始改" updated to move
+user-history sequence modeling from the top-ranked unexplored item to
+tested, with this finding and hypothesis recorded — remaining unexplored
+items (multi-target with `is_click`/`is_like`/etc., watch-time censored
+regression per CWM, other architectures, time/drift features, unbiased
+validation via the random-exposure log) are next, per the user's direction.
+
+Reproduce: `.venv/bin/python sequence_model.py --seed 0` → test primary 0.5965.
+
+## 2026-08-28 — Cheap diagnostic: does *any* sequence signal help, before building a heavier architecture?
+
+Motivation: the DIN result above was a clean null, but it doesn't distinguish
+between two very different explanations — (a) no sequence signal exists in
+this dataset beyond what `user_id`/`author_id` already capture, or (b) a
+sequence signal exists but DIN's smooth attention-pooling over up to 160
+history items failed to isolate it. These have opposite implications for
+what to try next (give up on sequence features vs. try a sharper mechanism),
+so before spending more time on BST/DIEN (literature-review turn, same
+conversation), ran the cheapest possible test: one binary feature, no
+attention, numpy only, minutes not an hour-long training run.
+
+**Feature:** `prior_exposure` = 1 if this user has `long_view`'d this *exact*
+`video_id` at any strictly-earlier `time_ms` (same cross-split chronological
+rule as `sequence.py`'s history builder — no leakage), else 0. Added as a 6th
+field to the existing 5-field FM, trained under BPR (current default),
+5 seeds, otherwise identical to the BPR FM baseline. Script:
+`ablation_prior_exposure.py` (self-contained, follows `ablation_features.py`'s
+pattern, no new dependencies).
+
+**Sanity check before trusting the result** (a single rare binary feature
+producing a real-looking lift is exactly the shape a leak or bug would take,
+so verified before logging): `prior_exposure=1` fires on only 0.20% of all
+rows (2,883 / 1,436,609), but among those rows the `long_view` rate is
+**78.5%**, vs. **33.1%** overall — a 2.4× lift, and directionally exactly
+what a "did they already watch and love this?" signal should look like.
+488 such rows land in the test split alone. This is a real behavioral
+pattern (repeat-watching previously-loved content), not an artifact.
+
+### Results (test set, mean ± population std over seeds 0–4)
+
+| model | GAUC | nDCG@5 | primary | Δ vs. BPR FM |
+|---|---|---|---|---|
+| BPR FM (5 fields, no sequence) | 0.6638 (σ=0.0007) | 0.5304 (σ=0.0004) | 0.5971 (σ=0.0005) | — |
+| BPR FM + DIN attention (previous entry) | 0.6634 (σ=0.0005) | 0.5299 (σ=0.0006) | 0.5967 (σ=0.0005) | −0.0004 |
+| **BPR FM + `prior_exposure` (6 fields)** | **0.6662** (σ=0.0003) | **0.5310** (σ=0.0003) | **0.5986** (σ=0.0003) | **+0.0015** |
+
+Per-seed test primary: 0.5982, 0.5987, 0.5985, 0.5987, 0.5990 (range
+0.5982–0.5990, tighter spread than BPR FM's own σ) — gap over BPR FM is
+~5× either model's σ. Real, not noise.
+
+### Finding: sequence signal *does* exist — DIN's mechanism, not the premise, was the problem
+
+Answers the motivating question directly: **explanation (b)**. A one-bit,
+hand-picked signal beats the full 160-item attention mechanism. This
+refines, rather than contradicts, the previous entry's catalog-saturation
+hypothesis — `user_id × video_id`'s bilinear FM term evidently doesn't fully
+resolve *exact-repeat* affinity from a single (or few) prior training
+exposure(s), even though in principle a low-rank interaction could
+approximate it given enough repeated exposures.
+
+**Likely mechanistic reason DIN missed this specifically:** DIN's softmax
+attention has to *learn* to place a sharp, near-all weight on an exact match
+among up to 160 history slots — but only ~0.18% of train rows are true
+repeat-exposures (2,086 of 1,141,112), so the attention MLP saw very few
+positive examples of "this is the pattern that should dominate the
+weighted average." A smooth, softmax-normalized mechanism trained on a rare
+pattern is a plausible way to end up diluting exactly the signal that
+matters most, rather than sharpening around it — whereas a hand-crafted
+indicator feature hands the FM the answer directly, bypassing that learning
+problem entirely.
+
+### Decision
+
+**This is real headroom, currently unclaimed.** Two directions, not
+mutually exclusive:
+1. **Cheap, immediate:** add `prior_exposure` (and similar sharp,
+   low-frequency indicator features — e.g. prior exposure to this exact
+   `author_id`, not just `video_id`) directly to `baseline.py`'s FM as
+   static fields. Small (+0.0015) but real, cheap, and stacks with BPR's
+   own gain.
+2. **If pursuing a sequence architecture further:** feed explicit
+   exact-match/repeat-count features into the attention mechanism's input
+   (e.g. concatenate a same-item flag into DIN's local activation unit)
+   rather than relying on the attention MLP to discover a rare pattern
+   from raw ID overlap alone — directly targets the failure mode diagnosed
+   here instead of trying a heavier architecture (BST/DIEN) that still
+   relies on the same smooth-pooling premise.
+
+Reproduce: `python3 ablation_prior_exposure.py` → 5-seed test primary mean
+0.5986.
+
+## 2026-08-28 — Fixing DIN's mechanism directly: feed `same_video` into the attention input
+
+Follow-up to the previous two entries. Tested decision option 2 above: instead
+of adding `prior_exposure` as a direct FM field, feed the same underlying
+information into DIN's attention mechanism itself — concatenate a `same_video`
+flag (1 if a given history slot's `video_id` equals the candidate's, else 0)
+into the local activation unit's input (`[hist, cand, hist−cand, hist×cand,
+same_video]`, 4k+1 dims instead of 4k). Hypothesis: DIN's softmax attention
+should now be able to *directly* key off this bit instead of having to infer
+"exact match" from the embedding difference vector being ≈0, which the
+previous entry's diagnosis suggested it wasn't reliably learning to do from
+only ~0.18% of train rows containing this pattern.
+
+Same verification discipline as the original DIN change: smoke-tested the
+all-PAD edge case (still exact-zero) and the PAD-embedding-row dead-gradient
+invariant (still exactly 0) before the real run — both passed. `sequence_model.py`
+modified in place (not a new file — `baseline.py` stays the frozen numpy
+reference; this is iteration on our own experimental code, same as the loss
+experiments iterated on `baseline.py` itself). Also added `--device`
+(`auto`/`cpu`/`cuda`/`mps`) and `train_seq.sbatch` for the SoC GPU cluster in
+the same sitting — unused for this particular run (still ran on CPU, same
+~70s/epoch), prepped for whatever's next.
+
+Command: `.venv/bin/python sequence_model.py --seed <0..4>` (same defaults
+as the previous DIN entry).
+
+### Results (test set, mean ± population std over seeds 0–4)
+
+| model | GAUC | nDCG@5 | primary | Δ vs. BPR FM |
+|---|---|---|---|---|
+| BPR FM (no sequence) | 0.6638 (σ=0.0007) | 0.5304 (σ=0.0004) | 0.5971 (σ=0.0005) | — |
+| BPR FM + DIN attention (plain) | 0.6634 (σ=0.0005) | 0.5299 (σ=0.0006) | 0.5967 (σ=0.0005) | −0.0004 |
+| **BPR FM + DIN attention + `same_video` input** | **0.6638** (σ=0.0006) | **0.5301** (σ=0.0006) | **0.5969** (σ=0.0006) | **−0.0002** |
+| *(for reference)* BPR FM + `prior_exposure` as a direct field | 0.6662 (σ=0.0003) | 0.5310 (σ=0.0003) | 0.5986 (σ=0.0003) | +0.0015 |
+
+Per-seed test primary: 0.5972, 0.5960, 0.5974, 0.5966, 0.5975 (range
+0.5960–0.5975). Epochs to convergence: 11, 14, 15, 9, 10 — similar range to
+plain DIN's 11/10/10/13/10.
+
+### Finding: giving the attention mechanism the same information does *not* recover the direct-feature gain
+
++0.0002 over plain DIN — smaller than either model's own σ, not a real
+improvement. Still −0.0002 vs. BPR FM itself, also within noise. The
+hypothesis was specific and testable — it failed cleanly, not ambiguously:
+handing the exact same bit of information to two different parts of the
+model produces two very different outcomes:
+
+- As a **direct FM field**: +0.0015, real (previous entry).
+- As an **attention-mechanism input**: +0.0002, noise (this entry).
+
+**Why the same information helps in one place and not the other:** a direct
+FM field gets its own linear weight — a single, easily-estimated global
+parameter answering "what's the average effect of `prior_exposure=1` on the
+score," learnable cleanly even from ~2,000 positive examples, *plus* it
+participates in every pairwise cross term automatically via the existing FM
+math. Routed through DIN instead, the same bit only ever influences the
+score *indirectly*: `same_video` → attention MLP → softmax logit → weighted
+share of `e_interest` → dot products → final score. That's a much longer
+chain for gradient to travel, and — critically — the *rarity* of the
+underlying pattern (~0.18% of train rows) doesn't change just because the
+input got easier to read; the attention MLP still only sees this exact
+pattern in ~2,000 training rows and has to learn an entire conditional
+weighting *function* around it, not just one scalar. Easier signal to detect
+≠ easier signal to learn to exploit through a longer, multiplicative
+computation graph.
+
+### Decision
+
+**Attention-mechanism fixes, at least this one, don't recover what a direct
+feature already gets for free.** This isn't just "try a bigger attention
+model" territory — the diagnosis here suggests the *mechanism itself*
+(routing a sharp, rare, strongly-predictive pattern through softmax-pooled
+attention rather than a direct linear term) is a poor fit for this specific
+kind of signal, independent of architecture size. That's a real reason for
+caution before investing in BST/DIEN (from the earlier literature-review
+turn) — both still fundamentally route information through the same kind of
+softmax-attention/weighted-combination pathway that just failed to exploit
+`same_video` even when handed explicitly.
+
+**Recommendation: bank the direct-feature win.** `prior_exposure` (+ similar
+sharp, hand-craftable indicators, e.g. prior exposure to this `author_id`)
+added straight to `baseline.py`'s FM is the validated, real gain on the
+table right now. `sequence_model.py`/`sequence.py` remain in the repo as
+correct, verified infrastructure, but two independent attempts to make the
+attention route pay off (plain pooling, then pooling with the fix that
+should have worked) both landed at noise. Per the user's direction on
+whether to pursue this further or move to banking the win / a different
+headroom item next.
+
+Reproduce: `.venv/bin/python sequence_model.py --seed 0` → test primary
+0.5972.
+
+## 2026-08-28 — Does temporal recency specifically carry signal? (before committing to DIEN)
+
+Motivation: after the previous entry's clean negative result, the question
+was whether to invest in BST/DIEN anyway. Their core differentiator over
+DIN is *order/temporal evolution*, not just set-membership — a different
+claim than anything tested so far (`prior_exposure` tests only "have I ever
+seen this," no time information). Ran the same cheap-diagnostic playbook
+again, this time testing recency specifically, before deciding.
+
+**Feature:** `author_recency` — bucketed time since this user's most recent
+prior `long_view` of *any* video by the candidate's `author_id` (11
+categories: "never" + 10 quantile buckets of the gap in hours, edges fit on
+train). Same strict-earlier-than-`time_ms` rule as before, added as a 6th
+FM field, BPR, 5 seeds. Script: `ablation_author_recency.py`.
+
+Chose author-level (not video-level) specifically to test something the FM
+doesn't already have a direct handle on: `user_id × author_id` is a static
+field, but *how recently* is a temporal signal layered on top of that
+static affinity — the qualitatively different kind of information BST/DIEN
+claim to add over DIN.
+
+### Results (test set, mean ± population std over seeds 0–4)
+
+| model | GAUC | nDCG@5 | primary | Δ vs. BPR FM |
+|---|---|---|---|---|
+| BPR FM (no sequence) | 0.6638 (σ=0.0007) | 0.5304 (σ=0.0004) | 0.5971 (σ=0.0005) | — |
+| BPR FM + `prior_exposure` (exact video, binary) | 0.6662 (σ=0.0003) | 0.5310 (σ=0.0003) | 0.5986 (σ=0.0003) | +0.0015 |
+| **BPR FM + `author_recency` (bucketed gap)** | **0.6663** (σ=0.0002) | **0.5313** (σ=0.0004) | **0.5988** (σ=0.0003) | **+0.0017** |
+
+Per-seed test primary: 0.5991, 0.5986, 0.5985, 0.5986, 0.5992. Real —
+~5.7× the std, tight spread.
+
+### Finding: recency carries real signal — but the shape is a step function, not smooth decay
+
+Answers the motivating question: yes, temporal information (not just
+set-membership) has value here. But breaking down the long_view rate by
+gap bucket shows *why*, and it's not what DIEN's design assumes:
+
+| gap since last author exposure | long_view rate | n |
+|---|---|---|
+| never | 33.0% | 1,421,731 |
+| ~0h (same-session adjacency) | **99.95%** | 2,171 |
+| <1h (not instant) | 22.6% (below baseline) | 805 |
+| 1h – 250h+ (all 8 remaining buckets) | flat, 41–45% | ~1,488 each |
+
+This is not a smooth decay curve. It's dominated by (1) a near-deterministic
+same-session adjacency effect (the very next impression after long-viewing
+someone is almost always long-viewed too — plausibly the recommender itself
+clustering an author's videos back-to-back in a session, not a learned
+"interest" pattern at all) and (2) a coarse, flat "seen this author recently
+at all vs. never" step that shows no visible further decay from 1 hour out
+to 10+ days. The `<1h`-but-not-instant bucket sitting *below* the "never"
+baseline (n=805, plausibly real, not obviously noise) is an unexplained
+wrinkle worth flagging rather than a clean part of the story.
+
+### Decision: this changes the calculus on DIEN specifically
+
+Two independent hand-crafted features (`prior_exposure`, `author_recency`)
+both show real, similar-sized gains (+0.0015, +0.0017) — this rules out
+"there's no sequence signal in this dataset" for good; the earlier DIN
+entries' failure was about DIN's specific mechanism, not the premise. That
+much strengthens the case for trying a properly-designed sequence
+architecture rather than abandoning the direction.
+
+But it specifically weakens the case for **DIEN**: DIEN's headline
+mechanism (GRU-based gradual interest evolution, AUGRU) is built to model
+smooth drift over a sequence. What's actually present here looks more like
+a step function at session boundaries (near-deterministic adjacency) plus a
+flat recent-vs-never split — not gradual decay. DIEN's specific design
+advantage (modeling *how* interest gradually evolves) may be solving a
+problem that isn't the one this dataset has. A much cheaper feature — e.g.
+"is this immediately preceded by a long_view of the same author in this
+session" — would likely capture most of what's in the adjacency effect
+without any of DIEN's engineering cost, and is a natural next experiment
+before committing to a heavier architecture.
+
+BST (order via self-attention + positional encoding, no gradual-evolution
+assumption) is not weakened by this finding the same way — still untested,
+still a reasonable next architecture if pursuing this further, since it
+doesn't assume smooth decay the way DIEN does.
+
+Reproduce: `python3 ablation_author_recency.py` → 5-seed test primary mean
+0.5988.
+
+## 2026-08-28 — Banking the wins: `prior_exposure` + `author_recency` folded into `data.py`/`baseline.py` permanently; adjacency tested standalone
+
+Two changes in this entry:
+
+**1. `prior_exposure` and `author_recency` are now permanent FM fields**, not
+one-off ablation scripts. New `temporal_features.py` (numpy-only,
+`build_temporal_features(splits)`) consolidates the cross-row temporal-scan
+logic that `ablation_prior_exposure.py`/`ablation_author_recency.py` each
+implemented independently; `data.py`'s `encode()` now calls it and appends
+both as columns 5–6 of `X` by default. `FIELDS` extended from 5 to 7
+entries. `build_vocab()` was decoupled from `len(FIELDS)` to make this safe
+(previously `vocabs = [dict() for _ in FIELDS]` would have silently created
+2 bogus empty vocab entries once `FIELDS` grew past the 5 static fields —
+caught and fixed before running anything). Verified: new `dim=40273`
+(40260 + 2 + 11, exactly as computed), `X.shape=(N,7)`, `prior_exposure`
+column has exactly 2086 positive rows in train — matches the earlier
+diagnostic exactly. `sequence.py`'s `build_history` and `sequence_model.py`
+both still work unchanged (they only special-case field index 1 = video_id,
+which is untouched by this change) — confirmed by re-running the history
+builder against the new pipeline before touching `baseline.py`.
+
+This changes what `python3 baseline.py --model fm` produces by default —
+same kind of default-changing move as the BPR loss switch, documented the
+same way.
+
+Command: `python3 baseline.py --model fm --loss pairwise --seed <0..4>`
+(no flag needed — this is now just what running the baseline does).
+
+### Results (test set, mean ± population std over seeds 0–4)
+
+| model | GAUC | nDCG@5 | primary | Δ vs. 5-field BPR FM |
+|---|---|---|---|---|
+| BPR FM, 5 fields (previous default) | 0.6638 (σ=0.0007) | 0.5304 (σ=0.0004) | 0.5971 (σ=0.0005) | — |
+| **BPR FM, 7 fields (new default)** | **0.6689** (σ=0.0005) | **0.5326** (σ=0.0005) | **0.6008** (σ=0.0004) | **+0.0037** |
+
+Per-seed test primary: 0.6015, 0.6007, 0.6003, 0.6009, 0.6004 — tight,
+consistent, well clear of the ε=0.002 convergence bar. The combined gain
+(+0.0037) is slightly more than the sum of the two features tested alone
+(+0.0015 and +0.0017 = +0.0032) — a small positive interaction, not just
+additive, plausible since some rows benefit from having both signals available
+at once rather than either alone.
+
+**2. Adjacency, tested standalone (not stacked on the new default) — confirms the step-function diagnosis cleanly**
+
+`ablation_adjacency.py`: a single binary feature — "was this user's
+immediately-preceding interaction (any row, chronologically) a `long_view`
+of this same `author_id`" — added as a 6th field to the *original* 5-field
+FM (same comparison basis as `prior_exposure`/`author_recency`'s own
+standalone tests, for direct comparability).
+
+| model | GAUC | nDCG@5 | primary |
+|---|---|---|---|
+| BPR FM (5 fields) | 0.6638 | 0.5304 | 0.5971 |
+| + `prior_exposure` (binary, exact video) | 0.6662 | 0.5310 | 0.5986 |
+| + `author_recency` (11-bucket gap) | 0.6663 | 0.5313 | 0.5988 |
+| **+ `adjacency` (binary, session-boundary only)** | **0.6662** (σ=0.0002) | **0.5310** (σ=0.0003) | **0.5986** (σ=0.0002) |
+
+Per-seed test primary: 0.5984, 0.5989, 0.5983, 0.5986, 0.5987. Positive rate:
+0.209% (3,005 / 1,436,609 rows) — comparable sparsity to `prior_exposure`'s
+0.20%.
+
+**One bit matches eleven buckets.** `adjacency`'s 0.5986 is indistinguishable
+from `author_recency`'s 0.5988 (both within each other's σ) — a single
+binary flag captures essentially the *entire* value of the much more
+elaborate 11-category recency feature. This confirms, more cleanly than the
+bucket breakdown in the previous entry, that `author_recency`'s value is
+overwhelmingly a session-adjacency step effect, not graded temporal decay.
+
+### Decision
+
+Two independent, validated wins are now permanently in `baseline.py`'s FM
+(0.5971 → 0.6008, +0.0037). `adjacency` itself was **not** added as a third
+field — it's redundant with `author_recency`, which already captures
+everything it does (the standalone comparison above establishes this; a
+combined-field test wasn't run since there's no remaining hypothesis left to
+test). `README.md` updated: baseline ladder, "已实测" section, files table,
+and the "运行" section's default-reproduction number all now reflect 0.6008
+as what the bare command produces.
+
+For the DIEN/BST question this thread started from: the adjacency result is
+further, cleaner confirmation that what's recoverable here is a sharp,
+near-deterministic session-boundary pattern, not smooth interest evolution —
+reinforcing the previous entry's caution specifically against DIEN's
+graded-decay mechanism, while leaving BST (order via self-attention, no
+decay assumption) untouched by this evidence either way.
+
+Reproduce: `python3 baseline.py --model fm --seed 0` → test primary 0.6015
+(7-field default). `python3 ablation_adjacency.py` → 5-seed test primary
+mean 0.5986 (standalone, vs. 5-field baseline).
+
+## 2026-08-28 — Multi-task learning: BPR + `is_click` auxiliary loss
+
+BST was next per the priority list, but is blocked on GPU access (self-attention
+training is ~35x slower than DIN on this machine's CPU — user is setting up
+the SoC cluster; a future entry will log BST results once that's available).
+Moved to the next unexplored item in the meantime: multi-task learning
+(README "从哪里开始改" #2).
+
+`is_click`/`is_like`/`is_follow`/`is_comment`/`is_forward`/`play_time_ms` are
+outcome labels of the *same* row being scored — unlike the sequence-modeling
+features, they can't be used as input features (that would be leakage: you
+can't condition a prediction on an outcome that doesn't exist yet at
+inference time). The only valid way to use them is as auxiliary training
+signals: train the shared embeddings to also predict a denser correlated
+outcome, hoping better-regularized/richer embeddings help the actual
+`long_view` ranking task even though only that task is scored.
+
+**Implementation**: new `loss='pairwise_multitask'` on `baseline.py`'s `FM`
+— same BPR main task (`step_pairwise`, unchanged) plus a pointwise BCE
+auxiliary loss on `is_click` (46.3% positive rate vs. `long_view`'s 33.7% —
+the denser signal the README flagged). Auxiliary task shares `V`
+(embeddings) with the main task but has its own linear head (`W_aux`,
+`b_aux`) so it doesn't corrupt the main task's own linear term — gradient
+from both tasks accumulates into the same `gV` before one combined Adam
+step; `W_aux`/`b_aux` get their own small local Adam update (own moment
+buffers, shared step counter). `data.py` gained `aux_labels(splits, col=
+'is_click')`, row-aligned with `encode()`'s output. Verified: plain
+`pairwise` reproduces byte-identical numbers after adding `W_aux`/`b_aux` to
+`FM.__init__` (no regression), multitask's aux BCE starts near `ln(2)≈0.693`
+(zero-initialized `W_aux`/`b_aux`, as expected) and decreases smoothly.
+
+Command: `python3 baseline.py --model fm --loss pairwise_multitask --seed <0..4>`
+(`--aux_weight` default 0.2).
+
+### Results (test set, mean ± population std over seeds 0–4)
+
+| model | GAUC | nDCG@5 | primary |
+|---|---|---|---|
+| BPR FM, 7 fields (current best, no aux task) | 0.6689 (σ=0.0005) | 0.5326 (σ=0.0005) | 0.6008 (σ=0.0004) |
+| **+ `is_click` auxiliary BCE (`aux_weight=0.2`)** | **0.6689** (σ=0.0005) | **0.5325** (σ=0.0004) | **0.6007** (σ=0.0004) |
+
+Per-seed test primary: 0.6014, 0.6006, 0.6004, 0.6005, 0.6005 — indistinguishable
+from the no-aux-task baseline (Δ = −0.0001, well inside σ).
+
+**Checked whether the weight was just too weak before concluding null**:
+single-seed test at `aux_weight=1.0` (5x stronger) gave test primary
+**0.5999** — not better, slightly *worse* than both `aux_weight=0.2`
+(0.6014 same seed) and the no-aux baseline. Stronger auxiliary pull doesn't
+help and may mildly hurt, pulling the shared embeddings toward optimizing
+click-prediction rather than the actual `long_view` ranking objective. This
+rules out "just needed a bigger weight" as an explanation — the result is a
+genuine null across the weight range tested, not an under-tuned setting.
+
+### Finding: no benefit from is_click multi-task supervision, at either weight tested
+
+The auxiliary task trains and converges normally (BCE loss decreases
+smoothly across epochs) — this isn't a broken implementation, the shared
+embeddings just don't end up better *for the ranking task specifically*
+from also being pushed to predict clicks. Plausible reading: `is_click` and
+`long_view` are correlated but represent different funnel stages (click =
+"decided to view", long_view = "found it worth watching") — the shared
+`user_id × video_id` embedding may already be expressive enough (echoing
+the earlier feature/capacity-ablation findings) that a correlated-but-distinct
+auxiliary objective doesn't add information beyond what `long_view`'s own
+BPR gradient already teaches it, and instead just spends some of the
+embedding's limited capacity/gradient budget on a goal that isn't the one
+being scored.
+
+### Decision
+
+Multi-task with `is_click` doesn't beat the 7-field BPR FM (0.6008 remains
+the number to beat). Not pursued further — the two weights tested (0.2, 1.0)
+bracket a wide enough range that a different single weight is unlikely to
+flip this, and there's no diagnosed specific reason (unlike the DIN
+`same_video` case) to expect a different weight would help. Other auxiliary
+targets (`is_like`, `play_time_ms` as regression, etc.) remain untested if
+this direction is revisited later, but given `is_click` — the densest,
+most-directly-related signal — showed nothing, they're not an obvious
+priority. README's "从哪里开始改" updated: multi-task moved from unexplored
+to tested.
+
+Reproduce: `python3 baseline.py --model fm --loss pairwise_multitask --seed 0`
+→ test primary 0.6014 (`aux_weight=0.2`, default).
+
+## 2026-08-28 — CWM-style watch-time censored regression, banked as new default
+
+README's next unexplored item: watch-time modeling per [CWM](https://github.com/hyz20/CWM)
+("counterfactual watch time"). Unlike the `is_click` multi-task attempt above
+(a distinct, only-correlated funnel-stage signal that showed nothing),
+watch time is the *direct underlying continuous quantity* `long_view` is
+almost certainly thresholded from — worth checking before writing this
+direction off.
+
+**Grounding in the actual data before designing anything** (previous
+sections of this log established the habit of verifying premises against
+real numbers rather than the literature's framing):
+- `play_time_ms >= 18000` (18s) alone matches `long_view` 96.7% of the time
+  — strong evidence `long_view` is a coarsened/binarized version of watch
+  time, not a distinct signal. This is the reason to expect watch-time
+  supervision might succeed where `is_click` didn't: it's not a different
+  correlated task, it's closer to the *ungrouped* version of the same one.
+- The classical CWM framing ("censored at the video's own length when
+  watched to completion") doesn't naively fit this dataset — videos loop.
+  17.3% of rows have `play_time_ms >= duration_ms`. But the distribution
+  within that group is revealing: **median ratio 1.09×, p75 1.48×, then a
+  sharp jump to p90 = 802×, p99 = 16,505×**. The bulk of "completed" views
+  cluster just past the boundary (consistent with genuine single-pass
+  completion plus measurement noise); a minority are extreme
+  multi-hundred-loop outliers (almost certainly passive/backgrounded
+  looping, not signal). This directly informed the design below: **use
+  `duration_ms` itself, not the raw `play_time_ms` value, as the
+  censored-row target** — sidesteps the noisy outlier tail entirely rather
+  than needing to cap/clip it.
+
+**Design** (`data.py::watch_time_targets`, `baseline.py::FM.step_pairwise_watchtime`,
+`loss='pairwise_watchtime'`): classical Tobit-style censored regression.
+`censored = (play_time_ms >= duration_ms)`. For uncensored rows (exact
+observation — user left before the video ended): standard squared-error
+regression toward `t = log1p(play_time_ms) / 12` (log1p for the wide
+dynamic range across durations 11K–250K+ ms; divide-by-12 just rescales
+into roughly `[0, 1.2]`, matching the gradient-magnitude order of the
+`is_click` BCE experiment so `aux_weight` values stay roughly comparable
+across experiments — not a theoretically meaningful constant). For censored
+rows: one-sided squared hinge toward `tau = log1p(duration_ms) / 12` — loss
+is `0.5·max(0, tau − z)²`, so predictions below the threshold are penalized
+(we know the truth is at least `tau`) but predictions above it aren't
+(we don't know by how much, so no assumption is made). Same shared-`V`,
+separate-linear-head (`W_aux`/`b_aux`) architecture as the `is_click`
+attempt — same code path, reused without modification.
+
+Command: `python3 baseline.py --model fm --loss pairwise_watchtime --seed <0..4>`
+(`--aux_weight` default 0.2, same default as the `is_click` attempt for a
+fair comparison).
+
+### Results (test set, mean ± population std over seeds 0–4)
+
+| model | GAUC | nDCG@5 | primary |
+|---|---|---|---|
+| BPR FM, 7 fields (previous default) | 0.6689 (σ=0.0005) | 0.5326 (σ=0.0005) | 0.6008 (σ=0.0004) |
+| + `is_click` auxiliary BCE (previous entry, null) | 0.6689 (σ=0.0005) | 0.5325 (σ=0.0004) | 0.6007 (σ=0.0004) |
+| **+ CWM-style watch-time censored regression (new default)** | **0.6702** (σ=0.0005) | **0.5333** (σ=0.0003) | **0.6017** (σ=0.0004) |
+
+Per-seed test primary: 0.6020, 0.6018, 0.6022, 0.6016, 0.6011 (range
+0.6011–0.6022) — a tighter spread than the no-aux-task baseline's own range
+(0.6003–0.6015), sitting consistently above it. Epochs to convergence: 11,
+10, 11, 15, 12 — similar range to the other BPR variants.
+
+### Finding: real, though more modest than the headline wins
+
++0.0009 on primary. By this project's own quick-heuristic yardstick (gap
+vs. the larger raw per-seed σ), that's ~2.25×σ — weaker than BPR's ~3×σ or
+`prior_exposure`'s ~5×σ, but clearly past the "smaller than either model's
+own σ" bar that marked the `is_click` attempt as null. A more careful
+check — standard error of the difference between the two independent
+5-seed means, `sqrt(σ₁²/5 + σ₂²/5)` — puts the gap at **~3.6 standard
+errors**, a comfortably significant difference; the raw-σ heuristic used
+elsewhere in this log is a conservative shortcut, not a rejection of this
+result. Being transparent about the calibration either way: this is a real
+but more marginal gain than the project's strongest findings, not another
+BPR-sized jump.
+
+**Why this succeeded where `is_click` didn't, most likely**: watch time is
+close to the actual continuous quantity `long_view` discretizes (96.7%
+match at an 18s threshold), so the auxiliary task teaches the shared
+embeddings a finer-grained version of the *same* preference signal instead
+of a distinct, only-correlated one. The proper censored-regression
+treatment (vs. naive squared-error on raw `play_time_ms`) matters
+mechanically too — naive regression would have been dominated by the noisy
+looping outliers found during the data investigation above, likely
+corrupting rather than helping the shared embeddings.
+
+### Decision
+
+**Adopted as the new default** (`baseline.py`'s `--loss` defaults to
+`pairwise_watchtime`), following the same pattern as the BPR-loss and
+temporal-feature adoptions: real, reproducible, stacks on top of everything
+already banked. `python3 baseline.py --model fm` now reproduces 0.6017;
+pass `--loss pairwise` explicitly to reproduce the pre-this-entry number
+(0.6008). `is_click` multi-task (previous entry) remains available via
+`--loss pairwise_multitask` but is not recommended (null result).
+`aux_weight` was not swept for this experiment (used the same 0.2 default
+as the `is_click` test for a controlled comparison) — worth revisiting if
+pursuing this further, alongside potentially replacing the fixed `scale=12`
+normalization with something derived from the data.
+
+Reproduce: `python3 baseline.py --model fm --seed 0` → test primary 0.6020
+(new default, `pairwise_watchtime`, `aux_weight=0.2`).
+
+## 2026-08-28 — Pushing further on the CWM direction: three follow-ups, all closed off
+
+After adopting watch-time censored regression, checked whether there was
+more to extract from the same direction before moving on. Three experiments,
+run in parallel since all are cheap (numpy):
+
+### 1. `aux_weight` sweep — confirms the default was already near-optimal
+
+Single-seed (seed 0) sweep across `--aux_weight ∈ {0.05, 0.1, 0.2, 0.3, 0.5,
+1.0, 2.0}` — a 40× span. Test primary stayed in a **0.6016–0.6022** band the
+entire way, no trend up or down. The default (0.2 → 0.6020) sits right in
+the middle of this flat region. **Nothing left to gain from tuning this
+knob** — a genuinely useful negative result, since it means the +0.0009 gain
+already banked isn't being left on the table by an under/over-tuned weight,
+and further sweeping isn't worth the time.
+
+### 2. `author_watch_affinity` — a new feature (not aux loss), modest and not adopted
+
+Hypothesis: `author_recency` captures *timing* of past engagement with an
+author; does *magnitude* (how strongly, on average, has this user engaged
+with this author's content before) carry separate value? Built
+`ablation_author_watch_affinity.py`: bucketed historical mean
+`log1p(min(play_time_ms, 10×duration_ms))` per (user, author) pair, same
+strict-earlier-than-`time_ms` rule as the other temporal features, same
+10× cap rationale as the censored-regression design (avoid the noisy
+looping tail polluting the running average). Tested standalone against the
+5-field baseline, same comparison basis as `author_recency`/`adjacency`.
+
+| model | GAUC | nDCG@5 | primary |
+|---|---|---|---|
+| BPR FM (5 fields) | 0.6638 | 0.5304 | 0.5971 |
+| + `author_recency` (timing) | 0.6663 | 0.5313 | 0.5988 |
+| + `author_watch_affinity` (magnitude) | 0.6651 (σ=0.0007) | 0.5308 (σ=0.0005) | 0.5980 (σ=0.0006) |
+
++0.0009 over baseline (σ ratio ~1.5×, weaker than `author_recency`'s ~5×),
+and notably *below* `author_recency` alone (−0.0008) rather than additive
+to it. Only 3.50% of rows have any prior (user, author) interaction to
+average over — many of those averages are estimated from just 1–2 samples,
+plausibly noisy enough to explain the weaker showing. Direction is
+plausible but not clearly adding a new dimension beyond what timing already
+captures — **not adopted**.
+
+### 3. `pairwise_combined` (is_click + watch-time together) — is_click stays null even in combination
+
+New `loss='pairwise_combined'`: both auxiliary tasks trained simultaneously,
+each with its own independent linear head (`W_aux`/`b_aux` for click,
+`W_aux2`/`b_aux2` for watch-time) sharing the same `V`. Tests whether
+`is_click`'s earlier null result was conditional on watch-time's absence
+(maybe it had nothing to add once the model was still "dumb," but could
+matter once watch-time raises the baseline) — a real, testable hypothesis,
+not just repeating the earlier experiment.
+
+| model | GAUC | nDCG@5 | primary |
+|---|---|---|---|
+| watch-time only (current default) | 0.6702 (σ=0.0005) | 0.5333 (σ=0.0003) | 0.6017 (σ=0.0004) |
+| **watch-time + is_click combined** | **0.6698** (σ=0.0005) | **0.5332** (σ=0.0005) | **0.6015** (σ=0.0005) |
+
+Statistically identical (−0.0002, well inside either σ). `is_click` doesn't
+add anything on top of watch-time either — the earlier null result wasn't
+conditional on model strength, it's a consistent finding regardless of
+what else is already in the model. **Not adopted.**
+
+### Decision
+
+All three follow-ups closed off cleanly — none changes the current default
+(`pairwise_watchtime`, `aux_weight=0.2`, 0.6017 test primary remains the
+number to beat). This is a good outcome for the *investigation*, not a
+failure: it confirms the watch-time gain is robust (insensitive to its own
+hyperparameter) and that the underlying signal has been extracted about as
+completely as this feature-engineering approach can get — `is_click`
+specifically appears to carry no information the shared embeddings don't
+already get from `long_view`'s own gradient, confirmed now under two
+different conditions. Time is better spent on a genuinely different lever:
+BST (pending GPU) or a model architecture change.
+
+Reproduce: `python3 baseline.py --model fm --loss pairwise_combined --seed 0`
+→ test primary 0.6021. `python3 ablation_author_watch_affinity.py` →
+5-seed test primary mean 0.5980.
+
+## 2026-08-29 — Model architecture change: DeepFM, a clean null
+
+Next unexplored item from the README (BST still pending GPU access).
+README's own reasoning ("capacity testing showed it's not the bottleneck")
+only tested more parameters *within FM's fixed bilinear shape* (`k=8/16/32`
+ablation) — a DNN branch is a structurally different kind of expressiveness
+(can represent nonlinear feature combinations FM's quadratic form cannot
+express at all, regardless of size), so this wasn't actually settled by the
+prior ablation. Worth testing rather than assuming, given how many other
+README priors in this log needed correction once measured (DIN's premise,
+`is_click`'s multi-task assumption).
+
+Brief literature check before implementing (see project's research-first
+convention from the sequence-modeling work): the README's reference set
+(DeepFM/DCN/xDeepFM, 2017–2018) has been superseded by DCN-V2/V3, GDCN, and
+notably **FinalMLP** (2023) — a pure two-stream-MLP architecture with *no*
+explicit interaction structure at all, which beats DCN-V2/xDeepFM/AutoInt+
+even on smaller benchmarks (MovieLens, Frappe), not just industrial-scale
+ones. That's evidence nonlinear combination capacity (what a DNN provides)
+can matter independent of *structured* explicit-interaction machinery. User
+chose **DeepFM** over FinalMLP as the first test: additive (`z = z_FM +
+z_DNN`, augments the validated FM term rather than replacing it, so a null
+result is unambiguous — unlike FinalMLP, where a negative result can't
+distinguish "no signal to find" from "worse architecture").
+
+**Implementation** (`deepfm_model.py`, torch — reuses `resolve_device` from
+`sequence_model.py`): `z_FM` is the exact same bilinear structure as
+`baseline.py`'s FM (shared `V`, same interaction formula). `z_DNN` flattens
+all 7 fields' embeddings (7k dims) through a small MLP (2 hidden layers,
+64→32, PReLU, dropout 0.2) to a scalar, summed with `z_FM`. Kept
+deliberately small — this project has repeatedly found bigger doesn't help
+at this dataset's scale (1.14M rows), and the point of this experiment is
+to test a *different* kind of expressiveness, not just add more parameters
+in a new shape. Trained under BPR, same pos/neg sampling as
+`baseline.py`'s `run_fm(loss='pairwise')`. Compared against the **clean**
+BPR FM 7-field baseline (0.6008, no watch-time auxiliary task) specifically
+— isolates the DNN branch's own contribution before considering whether to
+stack it with anything else.
+
+Smoke-tested clean before the real run: synthetic-batch forward/backward,
+no NaN in `V` or DNN parameter gradients.
+
+Command: `.venv/bin/python deepfm_model.py --seed <0..4>` (`--hidden 64 32`,
+`--dropout 0.2` defaults).
+
+### Results (test set, mean ± population std over seeds 0–4)
+
+| model | GAUC | nDCG@5 | primary |
+|---|---|---|---|
+| BPR FM, 7 fields (clean baseline) | 0.6689 (σ=0.0005) | 0.5326 (σ=0.0005) | 0.6008 (σ=0.0004) |
+| **+ DNN branch (DeepFM)** | **0.6687** (σ=0.0007) | **0.5328** (σ=0.0005) | **0.6007** (σ=0.0006) |
+
+Per-seed test primary: 0.6005, 0.6016, 0.6001, 0.6013, 0.6002 — gap vs.
+baseline is −0.0001, both by the raw-σ heuristic (−0.1×) and the more
+careful standard-error-of-the-difference check (−0.19×). About as clean a
+null as this log has recorded — not a marginal miss, no detectable effect
+in either direction.
+
+### Finding: the DNN branch finds nothing FM's bilinear term didn't already have
+
+Consistent with, and now directly testing, this project's standing
+hypothesis: `user_id × video_id`'s pairwise interaction already absorbs
+most of the learnable signal in this feature set (first established in the
+static-feature and capacity ablations, reconfirmed independently every time
+something new has been tried against it — DIN's attention, `is_click`
+multi-task, now nonlinear combination via a DNN). It's not that bigger
+models don't work here in general — it's that there doesn't appear to be
+additional *structure* among these particular 7 fields for a more
+expressive interaction function to find, whether that extra expressiveness
+comes from more capacity in FM's own shape (already tested, null) or a
+genuinely different shape (DNN, this entry, also null).
+
+### Decision
+
+**Not adopted.** `deepfm_model.py` kept in the repo as verified, reusable
+infrastructure in case revisited. Two natural follow-ups exist but are
+lower priority given this clean null: (a) stack the watch-time auxiliary
+task on top of DeepFM to see if a stronger training signal changes the
+DNN's ability to find something (the DNN failing to find structure isn't
+the same question as whether richer supervision would help it), (b) try
+FinalMLP specifically, since it replaces rather than augments and might
+access a genuinely different inductive bias — but per the project's now
+consistent pattern (features/capacity/attention/multi-task/architecture all
+converging on "the signal is concentrated in one pairwise term"), neither
+is expected to be a high-probability win. BPR FM + temporal features +
+watch-time (0.6017 test primary) remains the number to beat. BST (pending
+GPU) is the one still-open direction with a different-in-kind rationale
+(order-awareness, not just more expressiveness).
+
+Reproduce: `.venv/bin/python deepfm_model.py --seed 0` → test primary
+0.6005.
+
+## 2026-08-29 — Model architecture change, part 2: FinalMLP, mild underperformance
+
+Follow-up to the DeepFM entry. User wanted to try the more radical option
+too: **FinalMLP** (AAAI 2023) replaces FM's explicit interaction term
+entirely, rather than augmenting it — a genuinely different inductive bias,
+not just "DeepFM without the FM part." Confirmed the actual architecture
+from the paper before implementing (not just the earlier high-level
+description):
+
+- `e` = all 7 fields' embeddings concatenated.
+- Two independent MMOE-style gates: `h1 = 2·σ(gate1(e))⊙e`,
+  `h2 = 2·σ(gate2(e))⊙e` — same underlying features, but each stream sees a
+  different learned re-weighting of them.
+- Two small MLP towers (2 layers, 64 units, dropout 0.2 — same sizing
+  discipline as `deepfm_model.py`, same overfitting-risk reasoning) process
+  `h1`/`h2` independently into `o1`/`o2`.
+- **Multi-head bilinear fusion**: `o1`/`o2` split into 4 heads each; each
+  head pair combined via its own learned bilinear matrix
+  (`o1ₕᵀ Wₕ o2ₕ`), summed across heads, plus a bias — this is the *only*
+  place any interaction between the two streams happens, and it's the only
+  interaction structure in the whole model.
+
+No `V`/`W`/FM bilinear term anywhere in this model — `finalmlp_model.py` is
+a self-contained architecture, not layered on `baseline.py`'s FM at all.
+Same BPR training loop and comparison basis as the DeepFM entry (clean
+7-field BPR FM, 0.6008, no watch-time task) for direct comparability
+between the two architecture experiments.
+
+Smoke-tested clean before the real run (synthetic batch, no NaN in gates,
+either MLP stream, or the bilinear fusion parameters).
+
+Command: `.venv/bin/python finalmlp_model.py --seed <0..4>`
+(`--stream_dim 64 --n_heads 4 --dropout 0.2` defaults).
+
+### Results (test set, mean ± population std over seeds 0–4)
+
+| model | GAUC | nDCG@5 | primary |
+|---|---|---|---|
+| BPR FM, 7 fields (clean baseline) | 0.6689 (σ=0.0005) | 0.5326 (σ=0.0005) | 0.6008 (σ=0.0004) |
+| + DNN branch (DeepFM, previous entry) | 0.6687 (σ=0.0007) | 0.5328 (σ=0.0005) | 0.6007 (σ=0.0006) |
+| **FinalMLP (replaces FM entirely)** | **0.6681** (σ=0.0008) | **0.5324** (σ=0.0007) | **0.6002** (σ=0.0007) |
+
+Per-seed test primary: 0.6008, 0.6012, 0.5992, 0.6003, 0.5996. Gap vs.
+baseline: −0.0006 (−1.54 standard errors, −0.79× the larger raw σ) — not a
+statistically clean regression by this log's usual bar (would want ~2–3×),
+but consistently on the low side across all 5 seeds and also below
+DeepFM's result, not just noise scattered around zero.
+
+### Finding: another null, and the *shape* of the result is informative
+
+Where DeepFM landed almost exactly on the baseline (a wash — the DNN branch
+found nothing but also cost nothing), FinalMLP landed mildly *below* it.
+Plausible reading, given FinalMLP has no explicit bilinear term anywhere:
+the two-MLP-stream design has to learn the `user_id × video_id` interaction
+*implicitly*, from scratch, via gradient descent through gates and a
+bilinear fusion layer — a strictly harder learning problem than FM's exact,
+structurally-guaranteed bilinear form, which computes that interaction by
+construction rather than approximating it. On a dataset this size (1.14M
+rows), that implicit-learning disadvantage plausibly outweighs whatever
+FinalMLP's inductive bias offers elsewhere, especially since (per every
+prior entry in this section) there's little additional structure beyond
+that one pairwise term for its extra expressiveness to find anyway.
+
+This also retroactively supports the DeepFM entry's design choice
+(*augment*, don't replace): DeepFM kept the exact bilinear term intact and
+added capacity on top, costing nothing when the extra capacity found
+nothing. FinalMLP gave up the exact term and got a mild net negative for
+the trade. Both experiments point the same direction, but the replace-vs-
+augment framing turned out to matter for the downside, not just the upside.
+
+### Decision
+
+**Not adopted.** Third and fourth independent confirmations (with DeepFM)
+of the same finding this section has now established repeatedly: no
+detectable additional structure beyond `user_id × video_id` for a more
+expressive architecture to exploit, whatever form that expressiveness
+takes (bigger FM, DNN augmentation, or a fully different architecture).
+Model-architecture-change as a direction is now thoroughly closed off.
+BPR FM + temporal features + watch-time (0.6017 test primary) remains the
+number to beat. BST (pending GPU) remains the one open direction with a
+qualitatively different rationale (order-awareness) rather than "more
+expressiveness in some form."
+
+Reproduce: `.venv/bin/python finalmlp_model.py --seed 0` → test primary
+0.6008.
