@@ -1,5 +1,26 @@
 # KuaiRand-Pure Starter Kit
 
+## 🤖 真正的"自主智能体"交付物：`agent_loop.py`
+
+`RUN_LOG.md`/`ablation_*.py` 那一整套是**人（通过 Claude Code）手工驱动**的研究过程——
+读论文、提假设、决定下一步，全部由人（借助 LLM 当工具）决定。赛题要求的
+"Autonomous ML Research Agent" 指的是另一个东西：**一个自己调用 LLM、自己决定下一步
+试什么、自己判断有没有提升、自己按固定规则收敛的闭环程序**——这才是 Innovation /
+Autonomy / Feasibility 三项在评的对象，不是 FM 模型本身，也不是这个对话里人操作
+Claude Code 做的手工探索。
+
+`agent_loop.py` 就是这个闭环：无头调用本机的 Claude Code 二进制（`--print` 模式，
+真实的、单独计费的 API 调用）在一个**受限但真实**的动作空间里（`baseline.py` 已有的
+`--loss`/`--wt_target`/`--k`/`--lr`/`--aux_weight`/`--dns_n`/`--adt_beta`，不写新代码）
+提方案、跑训练、读指标、决定下一步，收敛判据（ε=0.002, N=3）在 Python 里硬编码检查，
+不靠 LLM 自己判断。全程**从没见过 `RUN_LOG.md`**——它的历史只有自己的 `AGENT_LOG.md`。
+
+实测一次真实运行（`AGENT_LOG.md`）：**5 轮后按规则自动收敛**，最终 5-seed 确认
+valid 0.6072±0.0002 / test 0.6012±0.0005，wall-clock 963 秒，LLM 成本 $0.182，
+**启动之后人工干预次数为 0**。跟人工探索结果的诚实对比（含"这个数字里有多少是
+agent 自己找到的、多少是继承自人工已经调好的 7 域特征管线"这层拆解）见
+`AGENT_VS_MANUAL.md`。
+
 ## ⚠️ 先看这个：哪些文件属于被评分的任务
 
 赛题口径（**已按完整题面核对过**，见 `RUN_LOG.md` 2026-08-30 的口径核对记录）：
@@ -16,6 +37,7 @@
 | `sequence_model.py` / `deepfm_model.py` / `finalmlp_model.py` / `lightgcn_model.py` | 试过的各种模型 |
 | `ablation_*.py` | 各项消融 |
 | `run_bonus.py` / `bonus_fm_torch.py` / `data_large.py` | bonus 数据集（1k / 27k），同一套任务和指标。`run_bonus.py`=numpy FM（1K 可用，27K 因稠密 Adam 更新不现实）；`bonus_fm_torch.py`=torch SparseFM（稀疏 embedding 更新，27K 用这个，需要 GPU） |
+| `agent_loop.py` / `AGENT_LOG.md` / `AGENT_VS_MANUAL.md` | **真正的自主智能体**（见本文件最上方）。`agent_loop.py` 是闭环程序；`AGENT_LOG.md` 是它自己跑出来的真实记录（5 轮收敛，人工干预=0）；`AGENT_VS_MANUAL.md` 是跟人工探索的诚实对比。 |
 
 | ❌ **不属于**评分任务 | 说明 |
 |---|---|
