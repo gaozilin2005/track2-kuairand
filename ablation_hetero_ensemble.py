@@ -117,6 +117,9 @@ if __name__ == '__main__':
     ap.add_argument('--device', default='auto')
     ap.add_argument('--member', default=None,
                     help='只训练这一个成员并把分数存到 scores/<name>.npz（分开跑，避免同时驻留爆内存）')
+    ap.add_argument('--seed', type=int, default=None,
+                    help='覆盖该成员默认的训练种子（fm_watchtime=0/fm_quantile=1/其它=0）。'
+                         '只用于多 seed 稳定性检查——不传就是原来的固定值，不影响任何已发表的数字。')
     ap.add_argument('--combine', action='store_true', help='读取 scores/ 下所有成员，做融合与评估')
     ap.add_argument('--scores_dir', default='./scores')
     ap.add_argument('--n_greedy', type=int, default=15,
@@ -135,24 +138,24 @@ if __name__ == '__main__':
     if a.member:
         name = a.member
         if name == 'fm_watchtime':
-            sva, ste = train_fm(splits, enc, dim, watch_time_targets(splits), seed=0)
+            sva, ste = train_fm(splits, enc, dim, watch_time_targets(splits), seed=a.seed if a.seed is not None else 0)
         elif name == 'fm_quantile':
-            sva, ste = train_fm(splits, enc, dim, watch_time_quantile_targets(splits), seed=1)
+            sva, ste = train_fm(splits, enc, dim, watch_time_quantile_targets(splits), seed=a.seed if a.seed is not None else 1)
         elif name == 'deepfm':
             from deepfm_model import run_deepfm
-            r = run_deepfm(splits, seed=0, device=a.device, verbose=False, return_scores=True)
+            r = run_deepfm(splits, seed=a.seed if a.seed is not None else 0, device=a.device, verbose=False, return_scores=True)
             sva, ste = r['valid_scores'], r['test_scores']
         elif name == 'finalmlp':
             from finalmlp_model import run_finalmlp
-            r = run_finalmlp(splits, seed=0, device=a.device, verbose=False, return_scores=True)
+            r = run_finalmlp(splits, seed=a.seed if a.seed is not None else 0, device=a.device, verbose=False, return_scores=True)
             sva, ste = r['valid_scores'], r['test_scores']
         elif name == 'lightgcn':
             from lightgcn_model import run_lightgcn
-            r = run_lightgcn(splits, seed=0, device=a.device, verbose=False, return_scores=True)
+            r = run_lightgcn(splits, seed=a.seed if a.seed is not None else 0, device=a.device, verbose=False, return_scores=True)
             sva, ste = r['valid_scores'], r['test_scores']
         elif name == 'bst':
             from sequence_model import run_seq
-            r = run_seq(splits, arch='bst', seed=0, device=a.device, L=a.bst_L,
+            r = run_seq(splits, arch='bst', seed=a.seed if a.seed is not None else 0, device=a.device, L=a.bst_L,
                         verbose=False, return_scores=True)
             sva, ste = r['valid_scores'], r['test_scores']
         else:
