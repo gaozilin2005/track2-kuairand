@@ -15,7 +15,7 @@
 | `make_submission.py` | **产出最终提交文件**（按 validation-best 选） |
 | `sequence_model.py` / `deepfm_model.py` / `finalmlp_model.py` / `lightgcn_model.py` | 试过的各种模型 |
 | `ablation_*.py` | 各项消融 |
-| `run_bonus.py` / `data_large.py` | bonus 数据集（1k / 27k），同一套任务和指标 |
+| `run_bonus.py` / `bonus_fm_torch.py` / `data_large.py` | bonus 数据集（1k / 27k），同一套任务和指标。`run_bonus.py`=numpy FM（1K 可用，27K 因稠密 Adam 更新不现实）；`bonus_fm_torch.py`=torch SparseFM（稀疏 embedding 更新，27K 用这个，需要 GPU） |
 
 | ❌ **不属于**评分任务 | 说明 |
 |---|---|
@@ -36,9 +36,10 @@
 | 迭代/实验条目 | `RUN_LOG.md` 21 条记录，覆盖约 35 组配置（每条常含多个 5-seed sweep） |
 | 主要基准 wall-clock | 单次 FM 训练约 30-40 秒（单核 CPU）；5-seed sweep 约 3-5 分钟 |
 | 最重的单项 | BST 在 CPU 上约 2450 秒/epoch → 改用 GPU 集群后约 22 秒/epoch（约 110 倍） |
-| Bonus 1K | 单次运行 1874 秒（31 分钟），峰值内存 2.68 GB |
-| GPU 用量 | 仅 BST 的 5 个 seed 在 SoC 集群跑过，约 15 分钟 GPU 时间；其余全部单核 CPU |
-| 硬件限制 | 本机 8 GB RAM —— 这是 27K 不可行、以及 BST 本地 OOM 的直接原因 |
+| Bonus 1K | 单次运行 1874 秒（31 分钟），峰值内存 2.68 GB（本机 CPU） |
+| Bonus 27K | 单次运行 4038 秒（67 分钟），GPU（TITAN V），真实峰值内存约 41GB（SparseFM，稀疏 embedding 更新） |
+| GPU 用量 | BST 5 个 seed（约 15 分钟）+ 27K SparseFM 一次（约 67 分钟），SoC 集群；其余全部单核 CPU |
+| 硬件限制 | 本机 8 GB RAM 挡住了 27K 用 numpy FM 的稠密更新（dim≈4090 万时纯粹是浪费计算量，不只是内存问题）和 BST 的本地重训；集群 GPU 节点（125GB RAM）+ 稀疏 embedding 实现解决了两者 |
 
 **人工干预次数.** 本次运行**不是全自动**。按性质分两类：
 - **任务指派**（"接下来试 X"）：约 15 次，属于正常的人类设定方向

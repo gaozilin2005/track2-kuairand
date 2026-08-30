@@ -132,8 +132,13 @@ if __name__ == '__main__':
     a = ap.parse_args()
 
     from data_large import load_columnar, encode_columnar
-    import resource
-    def peak_gb(): return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 ** 3)
+    import resource, sys
+    def peak_gb():
+        # ru_maxrss is bytes on macOS/BSD but KILOBYTES on Linux — without this factor
+        # the cluster silently under-reports by exactly 1024x (confirmed: an observed
+        # "0.04 GB" on the 27K run was actually ~41 GB).
+        factor = 1 if sys.platform == 'darwin' else 1024
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * factor / (1024 ** 3)
 
     t_start = time.time()
     print(f'loading {a.data_dir} (suffix={a.suffix}) ...')

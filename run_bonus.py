@@ -13,7 +13,7 @@
   python3 run_bonus.py --suffix 1k  --data_dir ./KuaiRand-1K/data
   python3 run_bonus.py --suffix 27k --data_dir ./KuaiRand-27K/data
 """
-import argparse, collections, resource, time
+import argparse, collections, resource, sys, time
 import numpy as np
 
 from data_large import load_columnar, encode_columnar
@@ -22,7 +22,10 @@ import baseline as B
 
 
 def peak_gb():
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 ** 3)
+    # ru_maxrss is bytes on macOS/BSD but KILOBYTES on Linux — without this factor
+    # the cluster silently under-reports by exactly 1024x.
+    factor = 1 if sys.platform == 'darwin' else 1024
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * factor / (1024 ** 3)
 
 
 def run_fm_bpr(enc, dim, k=16, lr=0.001, epochs=40, bs=8192, patience=4,
