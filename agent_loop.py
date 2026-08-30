@@ -43,9 +43,68 @@ import argparse, json, os, re, subprocess, sys, time, traceback
 
 CLAUDE_BIN = os.environ.get('CLAUDE_CODE_EXECPATH', 'claude')
 
+# Raw, neutral dataset facts -- no conclusions pre-drawn. Same discipline the hand-driven
+# RUN_LOG.md work used throughout (verify premises against real numbers before trusting a
+# method's framing), just handed to the agent as inputs rather than as our own conclusions.
+# This is the single biggest lever for Innovation & Problem Insight: an agent that connects
+# a method's assumptions to *these specific numbers* is doing real problem insight; an agent
+# with zero dataset context can only paraphrase what a loss function generically does.
+DATASET_FACTS = """Dataset facts (KuaiRand-Pure, computed directly from the data -- not conclusions,
+just numbers a researcher would want before choosing a method):
+  - Catalog size: ~7,551 videos, ~27,077 users with both positive and negative train impressions.
+  - Average interactions per video (train+valid+test): ~190.8 -- a small, repeat-heavy catalog,
+    not a large sparse one.
+  - long_view positive rate: ~33-34% overall.
+  - is_click positive rate: ~46% overall (denser than long_view, but a different funnel stage).
+  - play_time_ms >= 18000 alone matches long_view 96.7% of the time -- long_view looks like a
+    thresholded/coarsened version of a continuous watch-time quantity, not an independent signal.
+  - ~0.20% of rows are exact repeat-exposures (this exact user re-encountering this exact video
+    after a prior long_view of it).
+  - Evaluation is within-user reranking (GAUC + nDCG@5 computed per user's own impression group),
+    not full-catalog retrieval."""
+
+METHOD_REFERENCE = """Method reference -- mechanism and the assumption each one relies on (not
+whether it works on THIS data -- that's for you to reason about from the dataset facts above):
+  pointwise            : independent per-row classification (BCE). Doesn't align the training
+                         objective with a ranking metric.
+  pairwise (BPR)        : Rendle et al. 2009. Pairwise ranking loss -- directly optimizes relative
+                         order within a user's group, matching what GAUC/nDCG actually reward.
+  listwise             : softmax over a user's full impression group. Treats every positive
+                         equally; has no notion of "top-K" specifically.
+  lambdarank           : pairwise loss reweighted by |delta-nDCG@K| from the current model's own
+                         ranks. Assumes most sampled pairs land near the top-K cutoff where the
+                         reweighting has signal to work with; if most pairs are far from the
+                         cutoff, the reweighted gradient can vanish for most samples.
+  pairwise_multitask / : auxiliary BCE on is_click trained alongside the ranking loss, sharing
+  pairwise_combined      embeddings. Helps when the auxiliary label carries information the main
+                         label's own gradient doesn't already supply -- i.e. when the two labels
+                         are meaningfully independent signals, not just correlated restatements
+                         of each other.
+  pairwise_watchtime   : CWM-style censored regression toward a continuous watch-time quantity,
+  (log or quantile       with one-sided loss for truncated/looping views. Most useful when the
+   wt_target)            binary label being ranked is itself a coarsened version of that same
+                         continuous quantity, since then the auxiliary task teaches a finer-grained
+                         version of the same signal rather than a separate one.
+  pairwise_dns         : dynamic/hard negative sampling -- trains on the hardest-ranked negative
+                         from a sampled pool per positive. Theoretically connected to Top-K/OPAUC
+                         optimization. Relies on sampled negatives being reliable true negatives;
+                         in a small catalog with meaningful repeat-exposure, the "hardest" negative
+                         (the one the model is most confident is a positive) may not behave the
+                         same way as in a large low-repeat catalog.
+  pairwise_adt         : Adaptive Denoising Training (Wang et al., WSDM 2021). Downweights
+                         training pairs with high current-loss, on the premise that persistently
+                         high-loss pairs are more likely to be label noise than signal."""
+
 ACTION_SCHEMA = {
     "type": "object",
     "properties": {
+        "mechanism_basis": {"type": "string",
+            "description": "Which specific line from the method reference sheet motivates this "
+                            "choice, and which specific number from the dataset facts makes you "
+                            "expect its assumption to hold (or deliberately test whether it does "
+                            "or doesn't) on THIS data. Do not just restate what the method does "
+                            "generically -- connect it to a fact above or to a specific prior "
+                            "iteration's result."},
         "hypothesis": {"type": "string", "description": "One sentence: what you are testing and why, given the log so far."},
         "loss": {"type": "string", "enum": [
             "pointwise", "pairwise", "listwise", "lambdarank",
@@ -61,15 +120,20 @@ ACTION_SCHEMA = {
         "stop_early": {"type": "boolean",
                         "description": "Set true only if you believe the action space is exhausted and no further proposal is likely to help."}
     },
-    "required": ["hypothesis", "loss", "wt_target", "k", "lr", "aux_weight", "dns_n", "adt_beta", "stop_early"],
+    "required": ["mechanism_basis", "hypothesis", "loss", "wt_target", "k", "lr", "aux_weight",
+                 "dns_n", "adt_beta", "stop_early"],
 }
 
-SYSTEM_TASK_BRIEF = """You are the autonomous optimization loop for a Factorization Machine ranking \
+SYSTEM_TASK_BRIEF = f"""You are the autonomous optimization loop for a Factorization Machine ranking \
 model on KuaiRand-Pure (recommendation dataset). Task: rank each user's own logged impressions \
 by predicted long_view; metric = mean(GAUC, nDCG@5) on the validation split, called "primary". \
 Official baseline primary is 0.5946. Your job: propose ONE new configuration per turn to try to \
 beat the current best validation primary, using only the parameters listed below (this is the \
 entire action space available to you -- you cannot write new code or add features).
+
+{DATASET_FACTS}
+
+{METHOD_REFERENCE}
 
 Parameters you control:
   loss        : which training objective baseline.py uses (see enum)
@@ -82,8 +146,10 @@ Parameters you control:
 
 You will see the full log of every iteration you've already run, with its hypothesis, exact \
 configuration, and resulting valid/test primary score. Do not repeat an identical configuration \
-you've already tried. Reason about what the results so far imply and propose something genuinely \
-informative next -- not a hyperparameter you're picking at random. Set stop_early=true only if \
+you've already tried. Reason about what the results so far imply, and about which method's \
+assumption plausibly fits (or is worth deliberately stress-testing against) the dataset facts \
+above -- not a hyperparameter you're picking at random, and not a generic description of what a \
+loss function does. Set stop_early=true only if \
 you are confident the space you've been given is exhausted (e.g. every loss has been tried and \
 none beat the baseline meaningfully, and hyperparameter variation within the current best isn't \
 moving the number)."""
@@ -147,7 +213,11 @@ def main():
     ap.add_argument("--final_seeds", type=int, default=5, help="Seeds for the final confirmation run.")
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--data_dir", default="./KuaiRand-Pure/data")
-    ap.add_argument("--model", default="claude-haiku-4-5-20251001", help="Model used for the agent's own proposal calls.")
+    ap.add_argument("--model", default="sonnet", help="Model used for the agent's own proposal calls. "
+                    "Upgraded from Haiku to Sonnet: this run's improvement is specifically about "
+                    "reasoning depth (grounding choices in the method-reference + dataset-facts "
+                    "context), which benefits from the stronger model; cost stays low since each "
+                    "call is short and there are only a handful of iterations.")
     ap.add_argument("--max_budget_usd", type=float, default=0.20, help="Per-call budget cap passed to claude -p.")
     ap.add_argument("--log_path", default="AGENT_LOG.md")
     a = ap.parse_args()
@@ -193,12 +263,14 @@ def main():
         if action.get("stop_early"):
             stop_reason = "agent self-reported the action space exhausted"
             log_lines.append(f"\n## Iteration {it} -- agent requested early stop\n"
+                              f"**Mechanism basis:** {action.get('mechanism_basis', '(not provided)')}\n"
                               f"**Hypothesis given:** {action['hypothesis']}\n")
             flush_log()
             break
 
         metrics, dt, err, cmd = run_baseline(action, a.seed, a.data_dir, a.epochs)
         entry = [f"\n## Iteration {it}\n",
+                 f"**Mechanism basis:** {action.get('mechanism_basis', '(not provided)')}\n",
                  f"**Hypothesis:** {action['hypothesis']}\n",
                  f"**Command:** `{fmt_cmd(cmd)}`\n"]
 

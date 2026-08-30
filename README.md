@@ -15,7 +15,7 @@ found.
 | | GAUC | nDCG@5 | primary | Δ vs. baseline |
 |---|---|---|---|---|
 | Official baseline | 0.6610 | 0.5282 | 0.5946 | — |
-| **Autonomous agent's converged result** (`agent_loop.py`, 5 iterations, 0 manual interventions after launch) | 0.6694 | 0.5329 | 0.6012 | **+0.0066** |
+| **Autonomous agent's converged result** (`agent_loop.py`, 4 iterations, 0 manual interventions after launch) | 0.6686 | 0.5326 | 0.6006 | **+0.0060** |
 | Hand-driven exploration's best (heterogeneous ensemble) | 0.6724 | 0.5344 | 0.6034 | +0.0088 |
 
 ### Setup and installation
@@ -90,16 +90,27 @@ Autonomy / Feasibility 三项在评的对象，不是 FM 模型本身，也不�
 Claude Code 做的手工探索。
 
 `agent_loop.py` 就是这个闭环：无头调用本机的 Claude Code 二进制（`--print` 模式，
-真实的、单独计费的 API 调用）在一个**受限但真实**的动作空间里（`baseline.py` 已有的
-`--loss`/`--wt_target`/`--k`/`--lr`/`--aux_weight`/`--dns_n`/`--adt_beta`，不写新代码）
-提方案、跑训练、读指标、决定下一步，收敛判据（ε=0.002, N=3）在 Python 里硬编码检查，
-不靠 LLM 自己判断。全程**从没见过 `RUN_LOG.md`**——它的历史只有自己的 `AGENT_LOG.md`。
+真实的、单独计费的 API 调用，默认用 `sonnet`）在一个**受限但真实**的动作空间里
+（`baseline.py` 已有的 `--loss`/`--wt_target`/`--k`/`--lr`/`--aux_weight`/`--dns_n`/
+`--adt_beta`，不写新代码）提方案、跑训练、读指标、决定下一步，收敛判据（ε=0.002,
+N=3）在 Python 里硬编码检查，不靠 LLM 自己判断。全程**从没见过 `RUN_LOG.md`**——
+它的历史只有自己的 `AGENT_LOG.md`。
 
-实测一次真实运行（`AGENT_LOG.md`）：**5 轮后按规则自动收敛**，最终 5-seed 确认
-valid 0.6072±0.0002 / test 0.6012±0.0005，wall-clock 963 秒，LLM 成本 $0.182，
-**启动之后人工干预次数为 0**。跟人工探索结果的诚实对比（含"这个数字里有多少是
-agent 自己找到的、多少是继承自人工已经调好的 7 域特征管线"这层拆解）见
-`AGENT_VS_MANUAL.md`。
+**为了针对性提升 Innovation 表现**，prompt 里加了两块内容：一份中立的数据集事实
+（目录大小、密度、标签阈值行为——只给数字，不给结论）和一份方法参考表（每个 loss
+的出处论文和它依赖的**假设**，同样不告诉它这个假设在这个数据集上成不成立），并要求
+输出结构里必须给出 `mechanism_basis`——引用具体哪条参考、连到哪条数据事实。
+
+实测一次真实运行（`AGENT_LOG.md`）：**4 轮后按规则自动收敛**，推理质量有质的提升——
+迭代 2 正确引用"play_time≥18s 命中 96.7% long_view"这条事实来论证 watchtime 辅助
+任务；迭代 4 正确区分"watchtime 是同一信号的细粒度版本"和"is_click 是真正独立的
+信号"，这条区分跟我们人工探索当初的判断如出一辙。最终 5-seed 确认 valid
+0.6066±0.0002 / test 0.6006±0.0005，wall-clock 853 秒，LLM 成本 $0.346，
+**启动之后人工干预次数为 0**。诚实的补充：分数本身跟换 prompt 前的第一次运行
+（test 0.6012±0.0005）统计上无差别（−1.9 个标准误差）——**推理质量的提升没有换来
+分数的提升**，因为这个动作空间的天花板本来就在这附近，这正好是"Innovation 和
+Technical Execution 是两条独立评分轴"的一次干净对照。完整两次运行的对比见
+`RUN_AND_ITERATION_LOG.md`；跟人工探索结果的诚实对比见 `AGENT_VS_MANUAL.md`。
 
 ## ⚠️ 先看这个：哪些文件属于被评分的任务
 

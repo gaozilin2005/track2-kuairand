@@ -16,10 +16,25 @@ This submission has two distinct parts, kept deliberately separate rather than c
    `--dns_n`, `--adt_beta` flags — no new code is written by the agent). Each proposal is
    run as a real training job, its validation/test metrics are read back, and the
    competition's own convergence rule is checked in Python code — not delegated to the
-   model's judgment. A logged run converged in 5 iterations with **zero manual
-   intervention after launch**, landing on `pairwise_combined` (aux_weight=0.3): test
-   GAUC 0.6694 / nDCG@5 0.5329, a **+0.0066** score_dataset over the official baseline,
-   at 963s wall-clock and 14,715 total tokens.
+   model's judgment.
+
+   The prompt also grounds every proposal in a neutral dataset-facts block (catalog
+   size, interaction density, label-threshold behavior — numbers, not conclusions) and
+   a method-reference sheet naming each loss's origin paper and the assumption it
+   relies on, with a required `mechanism_basis` field forcing every choice to cite a
+   specific fact and assumption rather than restate what a loss generically does. The
+   submitted run (model: Sonnet) converged in 4 iterations with **zero manual
+   intervention after launch**, landing on `pairwise_multitask` (aux_weight=0.3,
+   k=32): test GAUC 0.6686 / nDCG@5 0.5326, a **+0.0060** score_dataset over the
+   official baseline, at 853s wall-clock and 8,367 total tokens. Its own reasoning
+   chain independently reconstructed much of the sequence the hand-driven track took
+   days to establish (BPR alignment fix → watch-time-style auxiliary → distinguishing
+   a genuinely independent auxiliary signal from a redundant one) — see
+   `RUN_AND_ITERATION_LOG.md` for a side-by-side comparison against an earlier,
+   ungrounded run (Haiku, no dataset context) whose hypotheses were generic
+   restatements and whose score was statistically indistinguishable from this one:
+   the grounding changed the reasoning quality, not the outcome, in this narrow
+   action space.
 
    The action space was deliberately kept narrow — CLI-flag selection, not free-form code
    generation — as a considered reliability trade-off: a tight space that reliably runs to
@@ -55,9 +70,11 @@ truth for judging whether the autonomous loop is finding real signal or noise), 
 ## APIs used
 
 - **Claude (via the local Claude Code CLI binary, headless `--print` mode)** — the only
-  API call the autonomous agent makes. Model used for agent proposal calls:
-  `claude-haiku-4-5`. No other external API was used (no OpenAI, no Google, etc.) and no
-  data outside the officially provided KuaiRand files was used.
+  API call the autonomous agent makes. Model used for the submitted run's proposal
+  calls: **Sonnet** (upgraded from an earlier Haiku-based run specifically to test
+  whether stronger reasoning improves proposal quality — see `RUN_AND_ITERATION_LOG.md`
+  for that comparison). No other external API was used (no OpenAI, no Google, etc.) and
+  no data outside the officially provided KuaiRand files was used.
 
 ## Libraries and frameworks
 
