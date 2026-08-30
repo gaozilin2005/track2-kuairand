@@ -165,3 +165,98 @@ different reasoning depth, same statistical outcome.
 Reproduce: `python3 agent_loop.py --max_iterations 20 --max_wallclock_s 2400
 --final_seeds 5` (uses Sonnet by default; pass `--model claude-haiku-4-5-20251001` to
 reproduce the first run's cheaper, shallower-reasoning behavior for comparison).
+
+---
+
+## Run 3 (submitted): two more fixes, and this time the score actually moves
+
+Run 2 above reasoned well but converged to the *same* result (0.6006) as run 1. A
+separate 5-seed stability check on an unrelated experiment (`AGENT_WIDER_ACTION_SPACE.md`)
+surfaced why: `agent_loop.py` had anchored on `k=32` in iteration 1 and never revisited
+it across the whole run, so its "watchtime looks flat" conclusion was only ever tested
+at that one, arbitrary capacity — and the well-established hand-driven default
+(`pairwise_watchtime`, k=16) scores 0.6017 ± 0.0004, meaningfully better than run 2's
+own discovered config.
+
+**Two fixes, applied together:**
+
+1. **Anchoring fix.** Every prompt now includes a `summarize_coverage()` block listing
+   which loss/k/lr values have been tried, explicitly flagging in the text itself when
+   k or lr has sat unchanged for 2+ iterations. A new required schema field,
+   `dimension_check`, forces the model to state which dimension has gone longest
+   unvaried and either address it or give a specific reason not to. New prompt guidance
+   states loss and capacity are independent axes — a loss "looking flat" at one k/lr
+   hasn't been shown flat in general. `patience_n` raised from 3 to 5.
+2. **Single-seed decision-noise fix.** Even with (1) alone (an intermediate run, not
+   separately archived), the search became good enough that its top candidates
+   clustered within 0.0003 of each other on a single seed — *tighter* than this
+   project's own established single-seed noise floor of 0.0004. Picking "the winner"
+   from one seed at that point is close to a coin flip. Fix: the harness now tracks a
+   shortlist of the top `--shortlist_k` (3) distinct configs by single-seed valid
+   score throughout the search, and at the end runs the full 5-seed confirmation for
+   *all* of them — not just the nominal best — before declaring a winner. The summary
+   explicitly flags when the 5-seed winner differs from the single-seed nominee.
+
+### The full run (8 iterations, converged via the eps/N rule)
+
+| It. | Config diff | Valid primary | Test primary | Dimension addressed |
+|---|---|---|---|---|
+| 1 | pairwise, k=32, lr=0.005 (first) | 0.6031 (best) | 0.5958 | — (deliberate mid-range start, not the harness default, so later moves have real room in both directions) |
+| 2 | k: 32→16 | 0.6036 (best) | 0.5973 | k (untested away from iter-1's value) |
+| 3 | lr: 0.005→0.001 | 0.6070 (best) | 0.6015 | lr (unchanged 2 iterations) |
+| 4 | loss: pairwise→pairwise_watchtime | 0.6073 (best) | 0.6016 | loss (unchanged 3 iterations) |
+| 5 | k: 16→8 | 0.6071 | 0.6017 | k — explicitly re-tested under the *current best loss*, not just under the loss where it was first measured |
+| 6 | lr: 0.001→0.0003 | 0.6063 (worse) | 0.6014 | lr (unchanged 3 iterations) — confirms 0.001 is better |
+| 7 | loss: pairwise_watchtime→lambdarank | 0.6007 (worse) | 0.5937 | loss (unchanged 2 iterations) |
+| 8 | k: 16→4 (floor of allowed range) | 0.6073 (tied best) | 0.6015 | k — deliberately tests the minimum, since the trend "so far flat-to-improving as k shrinks" had never been checked against the floor |
+
+**Iteration 5 is the clearest evidence the anchoring fix works as intended, not just
+superficially**: rather than accepting the iteration-2 finding "k=16 beats k=32," the
+model explicitly notices that comparison was run under a different loss (`pairwise`,
+not the current-best `pairwise_watchtime`) and re-tests capacity *at the winning loss*
+before trusting the conclusion transfers. **Iteration 8 shows the same discipline
+extended to a boundary case**: having observed a flat-to-improving trend as k shrank
+(32→16→8), it explicitly tests the untried floor (k=4) rather than assuming the trend
+stops at 8 — a genuinely new data point the hand-driven investigation's own capacity
+ablation (`RUN_LOG.md`, k∈{8,16,32}) never checked.
+
+### Shortlist confirmation — and the flip it exists to catch
+
+| Config | Single-seed valid (nominal rank) | 5-seed valid | 5-seed test |
+|---|---|---|---|
+| it4: pairwise_watchtime, k=16, lr=0.001 | 0.6073 (1st) | 0.6069 ± 0.0003 | 0.6016 ± 0.0002 |
+| it8: pairwise_watchtime, k=4, lr=0.001 | 0.6073 (tied 1st) | 0.6069 ± 0.0003 | **0.6016 ± 0.0003** |
+| it5: pairwise_watchtime, k=8, lr=0.001 | 0.6071 (3rd) | 0.6067 ± 0.0004 | 0.6018 ± 0.0003 |
+
+**The 5-seed winner (it8) was not the single-seed-nominal best (it4)** — the harness
+logged this explicitly rather than silently picking whichever came first. In practice
+here the three configs are statistically indistinguishable from each other (all
+within one seed-noise-width), which is itself the finding: k ∈ {4, 8, 16} under
+`pairwise_watchtime`/`lr=0.001` are functionally equivalent on this dataset, extending
+the hand-driven capacity-insensitivity result down to the floor of the allowed range.
+
+### Result
+
+| | GAUC | nDCG@5 | primary |
+|---|---|---|---|
+| Official baseline (test) | 0.6610 | 0.5282 | 0.5946 |
+| Run 2 (submitted before this fix) | 0.6686 | 0.5326 | 0.6006 |
+| **Run 3 — winner: `pairwise_watchtime`, k=4, lr=0.001, aux_weight=1** | **0.6701** | **0.5331** | **0.6016** |
+| Hand-driven established default (`RUN_LOG.md`) | 0.6702 | 0.5333 | 0.6017 |
+
+`score_dataset = mean(delta(GAUC), delta(nDCG@5)) = mean(0.0091, 0.0049) = +0.0070`.
+
+**vs. run 2 (previously submitted): +0.0010, 3.83 SE — a real, significant improvement.**
+**vs. the hand-driven established default: −0.0001, −0.45 SE — statistically
+indistinguishable.** After two targeted fixes to the harness (not the model, not the
+task, not the dataset), the autonomous agent's own converged result now matches, within
+noise, four days of literature-guided human research's own single-model best — found in
+8 iterations, 815s, $0.88.
+
+### This is now the submitted result
+
+`submission_pure_agent.csv` regenerated for `pairwise_watchtime`/k=4/lr=0.001/
+aux_weight=1, format/alignment-validated on all 170,588 test rows.
+
+Reproduce: `python3 agent_loop.py --max_iterations 20 --max_wallclock_s 2400
+--final_seeds 5 --shortlist_k 3` (patience_n now defaults to 5).

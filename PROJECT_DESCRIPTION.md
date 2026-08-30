@@ -22,19 +22,27 @@ This submission has two distinct parts, kept deliberately separate rather than c
    size, interaction density, label-threshold behavior — numbers, not conclusions) and
    a method-reference sheet naming each loss's origin paper and the assumption it
    relies on, with a required `mechanism_basis` field forcing every choice to cite a
-   specific fact and assumption rather than restate what a loss generically does. The
-   submitted run (model: Sonnet) converged in 4 iterations with **zero manual
-   intervention after launch**, landing on `pairwise_multitask` (aux_weight=0.3,
-   k=32): test GAUC 0.6686 / nDCG@5 0.5326, a **+0.0060** score_dataset over the
-   official baseline, at 853s wall-clock and 8,367 total tokens. Its own reasoning
-   chain independently reconstructed much of the sequence the hand-driven track took
-   days to establish (BPR alignment fix → watch-time-style auxiliary → distinguishing
-   a genuinely independent auxiliary signal from a redundant one) — see
-   `RUN_AND_ITERATION_LOG.md` for a side-by-side comparison against an earlier,
-   ungrounded run (Haiku, no dataset context) whose hypotheses were generic
-   restatements and whose score was statistically indistinguishable from this one:
-   the grounding changed the reasoning quality, not the outcome, in this narrow
-   action space.
+   specific fact and assumption rather than restate what a loss generically does.
+
+   Three runs were needed to reach the submitted result, each fixing a specific,
+   diagnosed problem in the one before it — the full story, including two failure
+   modes found and fixed rather than papered over, is in `RUN_AND_ITERATION_LOG.md`.
+   Run 1 (Haiku, no dataset context) produced generic, docstring-level hypotheses.
+   Run 2 (Sonnet, grounded) reasoned dramatically better but converged to a
+   statistically identical score, because it anchored on `k=32` in iteration 1 and
+   never revisited it — a hyperparameter-anchoring bug diagnosed via a stability
+   check on an unrelated experiment. **Run 3** adds a parameter-coverage summary and a
+   required `dimension_check` field (forcing the model to notice and address stale
+   dimensions) plus a shortlist-confirmation step (the harness runs the full 5-seed
+   confirmation on the top 3 distinct candidates, not just the nominal single-seed
+   best, after the search got good enough that its top candidates clustered *inside*
+   this project's own single-seed noise floor). The submitted run converged in 8
+   iterations with **zero manual intervention after launch**, landing on
+   `pairwise_watchtime` (k=4, lr=0.001, aux_weight=1): test GAUC 0.6701 / nDCG@5
+   0.5331, a **+0.0070** score_dataset over the official baseline — statistically
+   indistinguishable (−0.45 SE) from the hand-driven track's own long-established
+   single-model default, reached independently after fixing the harness rather than
+   the model or the task.
 
    The action space was deliberately kept narrow — CLI-flag selection, not free-form code
    generation — as a considered reliability trade-off: a tight space that reliably runs to

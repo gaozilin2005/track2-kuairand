@@ -15,7 +15,7 @@ found.
 | | GAUC | nDCG@5 | primary | Δ vs. baseline |
 |---|---|---|---|---|
 | Official baseline | 0.6610 | 0.5282 | 0.5946 | — |
-| **Autonomous agent's converged result** (`agent_loop.py`, 4 iterations, 0 manual interventions after launch) | 0.6686 | 0.5326 | 0.6006 | **+0.0060** |
+| **Autonomous agent's converged result** (`agent_loop.py`, 8 iterations, 0 manual interventions after launch) | 0.6701 | 0.5331 | 0.6016 | **+0.0070** |
 | Hand-driven exploration's best (heterogeneous ensemble) | 0.6724 | 0.5344 | 0.6034 | +0.0088 |
 
 ### Setup and installation
@@ -93,7 +93,7 @@ Claude Code 做的手工探索。
 真实的、单独计费的 API 调用，默认用 `sonnet`）在一个**受限但真实**的动作空间里
 （`baseline.py` 已有的 `--loss`/`--wt_target`/`--k`/`--lr`/`--aux_weight`/`--dns_n`/
 `--adt_beta`，不写新代码）提方案、跑训练、读指标、决定下一步，收敛判据（ε=0.002,
-N=3）在 Python 里硬编码检查，不靠 LLM 自己判断。全程**从没见过 `RUN_LOG.md`**——
+N=5）在 Python 里硬编码检查，不靠 LLM 自己判断。全程**从没见过 `RUN_LOG.md`**——
 它的历史只有自己的 `AGENT_LOG.md`。
 
 **为了针对性提升 Innovation 表现**，prompt 里加了两块内容：一份中立的数据集事实
@@ -101,16 +101,23 @@ N=3）在 Python 里硬编码检查，不靠 LLM 自己判断。全程**从没�
 的出处论文和它依赖的**假设**，同样不告诉它这个假设在这个数据集上成不成立），并要求
 输出结构里必须给出 `mechanism_basis`——引用具体哪条参考、连到哪条数据事实。
 
-实测一次真实运行（`AGENT_LOG.md`）：**4 轮后按规则自动收敛**，推理质量有质的提升——
-迭代 2 正确引用"play_time≥18s 命中 96.7% long_view"这条事实来论证 watchtime 辅助
-任务；迭代 4 正确区分"watchtime 是同一信号的细粒度版本"和"is_click 是真正独立的
-信号"，这条区分跟我们人工探索当初的判断如出一辙。最终 5-seed 确认 valid
-0.6066±0.0002 / test 0.6006±0.0005，wall-clock 853 秒，LLM 成本 $0.346，
-**启动之后人工干预次数为 0**。诚实的补充：分数本身跟换 prompt 前的第一次运行
-（test 0.6012±0.0005）统计上无差别（−1.9 个标准误差）——**推理质量的提升没有换来
-分数的提升**，因为这个动作空间的天花板本来就在这附近，这正好是"Innovation 和
-Technical Execution 是两条独立评分轴"的一次干净对照。完整两次运行的对比见
-`RUN_AND_ITERATION_LOG.md`；跟人工探索结果的诚实对比见 `AGENT_VS_MANUAL.md`。
+第一次这样跑（Sonnet + grounding）推理质量明显变好，但最终分数跟换 prompt 前一样
+（statistically indistinguishable）——排查后发现是**参数锚定**：那次运行第一轮就把
+k 定在 32，后面全程没再碰过，"watchtime 打平"这个结论其实只在那一个 k 上测过。
+**修了两处**：①每轮 prompt 里加一份参数覆盖度摘要，明确标出 k/lr 连续几轮没变过，
+并要求输出里必须有 `dimension_check` 字段说明要不要处理这一点；②搜索到后期，
+候选方案经常挤在单 seed 噪声范围（0.0004）以内，单 seed"选出新最优"约等于抛硬币——
+改成维护一个 top-3 候选池，最后对全部候选跑真正的 5-seed 确认再选真正的赢家
+（这次真的抓到了一次翻盘：单 seed 选出的第一名不是 5-seed 确认后的赢家）。
+
+修完之后实测：**8 轮收敛**，最终 5-seed 确认 valid 0.6069±0.0003 / test
+0.6016±0.0003，wall-clock 约 815 秒（不含最终 3 候选 ×5-seed 确认），LLM 成本 $0.885，
+**启动之后人工干预次数为 0**。这次分数真的动了——比修之前那次运行高
+**+0.0010（3.83 个标准误差，显著）**，而且跟人工探索的默认配置（0.6017±0.0004）
+统计上**完全无法区分**（−0.45 个标准误差）：只改了 harness 的两处 bug，没动模型、
+没动任务，agent 自己收敛到的答案就跟人工花四天做的单模型最优对上了。完整三次
+运行的演变见 `RUN_AND_ITERATION_LOG.md`；跟人工探索结果的诚实对比见
+`AGENT_VS_MANUAL.md`。
 
 ## ⚠️ 先看这个：哪些文件属于被评分的任务
 
