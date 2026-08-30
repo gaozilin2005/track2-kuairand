@@ -2001,3 +2001,76 @@ valid 0.6091 / test 0.6034）作为最优提交配置。`ablation_stacked_ensemb
 
 Reproduce: `python3 ablation_stacked_ensemble.py`（需要 `scores/*.npz` 已存在，
 全部复用已缓存的成员分数，不需要重新训练任何模型，几秒内跑完）。
+
+
+## 2026-08-30 — 官方画像/统计文件：单模型无收益，作为集成成员也无收益（含机制解释）
+
+**Hypothesis.** 两个官方随数据集发布、但从没被任何实验碰过的文件：
+`user_features_pure.csv`（用户画像：活跃度、关注/粉丝/好友数分桶、注册天数分桶、
+18 个匿名 one-hot 特征）和 `video_features_statistic_pure.csv`（视频全站聚合统计：
+show_cnt/play_cnt/complete_play_cnt/like_cnt/... ，数值量级明显大于我们日志里
+140 万行能统计出来的规模，说明是全站范围的统计，不是从我们这批数据里数出来的）。
+
+这不是又一次"加特征"——之前加的时序特征都是从同一批 140 万行日志里统计出来的
+（信息来源没变，只是统计方式变了）；这两个文件是**真正独立的信息源**，理论依据
+参考 LightFM（Kula, 2015，"Metadata Embeddings for Cold-start Recommendations"）：
+FM 的双线性交互让画像域的 embedding 可以跟 video_id/author_id 的 embedding 做
+内积，这个内积**会随视频变化**，所以理论上能影响组内排序——不同于本项目早就
+证明的"纯加性用户特征对排序贡献恒为零"（那是因为没有参与交互项）。100% 的
+user_id/video_id 覆盖率，字段基数都不大（7~9 类），实现干净。
+
+**Code diff.** 新增 `ablation_side_features.py`。用户侧选 5 个已经分桶好的域
+（`user_active_degree`/`follow_user_num_range`/`fans_user_num_range`/
+`friend_user_num_range`/`register_days_range`）；视频侧构造 2 个域：
+`show_cnt` 十分位分桶（全站曝光量）、`complete_play_cnt/play_cnt` 十分位分桶
+（全站完播率——语义上跟 long_view 本身很接近，但是全站口径，比我们自己这段
+日志能给稀疏视频估出来的完播率更可信）。对照基准是当前最优 7 域配置。
+
+**Metrics（test，5 seed，mean ± population std）.**
+
+| 配置 | primary | Δ vs 对照 | 显著性 |
+|---|---|---|---|
+| 当前默认 7 域（对照） | 0.6017 ± 0.0004 | — | — |
+| + 用户画像（12 域） | 0.6016 ± 0.0003 | −0.0001 | −0.45σ |
+| + 视频全站统计（9 域） | 0.6022 ± 0.0005 | +0.0005 | **1.75σ** |
+| + 两者都加（14 域） | 0.6015 ± 0.0005 | −0.0002 | −0.70σ |
+
+**三个都判为无收益**（本项目一贯的 2~3σ 门槛）。视频统计最接近，但没够到。
+
+**一个值得记录的交互效应**：两者一起加（0.6015）比只加视频统计（0.6022）还低
+0.0007——不是"两个小收益加起来"，是叠加后**更差**。这跟本项目反复出现的
+"域数越多不代表越好"是同一个规律的又一次印证，不是巧合。
+
+**追加检查：视频统计模型能不能当异构集成的新成员？** 逻辑跟 BST 的教训一致——
+一个单独打平的模型，如果错误模式跟现有成员足够不同，仍然可能有集成价值
+（BST 单独只是打平，但相关性 0.885~0.892，是当前最优集成的关键成员）。
+训练视频统计版模型（9 域，test 单独 0.6027），缓存为 `scores/side_video.npz`，
+跑 7 成员的 `ablation_hetero_ensemble.py --combine`：
+
+|              | bst   | deepfm | finalmlp | fm_quant | fm_watch | lightgcn | **side_video** |
+|---|---|---|---|---|---|---|---|
+| **side_video** | 0.888 | 0.924 | 0.924 | 0.947 | **0.960** | 0.597 | 1.000 |
+
+**跟 FM 系（尤其 fm_watchtime，0.960）高度相关，完全不在 BST（0.56~0.59）或
+LightGCN 那个量级。** 原因很直接：`side_video` 就是同一套 FM + BPR + watchtime
+辅助任务，只是多了 2 个域——**机制没变，只是多喂了点数据**，错误模式自然跟同
+机制的其它成员高度重合。真正带来低相关性的是 BST（读取顺序，机制不同）和
+LightGCN（图传播，机制不同），不是"喂了没见过的数据"本身——这是对上一条集成
+记录里"要找读取不同信息的模型"这句话的一次重要澄清：**决定错误相关性的是
+模型的计算机制，不是输入数据的来源**；同一个 FM 机制不管喂什么新特征，产出
+的错误模式都很难跟"另一个 FM 变体"拉开距离。
+
+穷举式子集搜索（在全部 valid 上评估，更保守的方法）**完全排除了 side_video**，
+结果跟不含它时一模一样（valid 0.6091 / test 0.6034，子集仍是
+`{bst, fm_quantile, fm_watchtime}`）。贪心加权搜索（更大的自由度：7 个成员整数
+权重 × 4 种融合）给出 valid 0.6092 / test **0.6036**，比当前最优高 0.0002——
+但考虑到这个搜索空间比之前大了不少（多一个成员意味着更多候选组合），而上一条
+stacking 记录刚证明"搜索/拟合自由度更大不代表泛化更好"，这 0.0002 大概率是
+噪声，不当作新纪录。
+
+**Decision.** 不采用（单模型和集成成员两个角度都不采用）。`data.py`/`FIELDS`
+不变。`ablation_side_features.py` 和 `scores/side_video.npz` 留仓库里作归因记录。
+当前最优提交配置维持 valid 0.6091 / test 0.6034（`{bst, fm_quantile,
+fm_watchtime}`，z-score 融合）。
+
+Reproduce: `python3 ablation_side_features.py --seeds 5`

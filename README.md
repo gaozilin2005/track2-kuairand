@@ -215,6 +215,7 @@ python3 submit.py --score --split valid submission.csv    # 校验并打分（�
 | **种子集成（同构）** —— `ablation_ensemble.py`，把 N 个 seed 训出的模型的**预测分**平均 | 单模型均值 0.6018 → 集成 **0.6025**（+0.0007，约 1.8σ，3 个模型即饱和）。**有小幅收益但很快见顶**——成员之间只差随机种子，误差高度相关，能削减的方差有限。见下一行。 |
 | **异构集成** —— `ablation_hetero_ensemble.py`，把**架构不同**的 5 个模型（BST / DeepFM / FinalMLP / 2 个 FM 变体）的预测融合；试了 raw / z-score / rank / RRF 四种融合方式；**融合方式和成员子集只在 valid 上选，test 只报一次** | **0.6034**（valid 选出 z-score + {bst, fm_quantile, fm_watchtime}），比最好的单模型高 **+0.0017（约 4σ）**、比同构集成高 **+0.0009（约 2.3σ）**。**这是目前项目最好的结果。** 机制在成员相关性矩阵里：**BST 跟其它成员的 rank 相关只有 0.885~0.892，而非 BST 成员两两之间是 0.926~0.973**（DeepFM 和 FinalMLP 甚至高达 0.973——架构看着天差地别，其实在算同一件事）。差异在**读取的信息**（BST 用了顺序）才带来互补误差；差异在**怎么算交互**则不会。这也部分推翻了上一行的结论（"方差削减动不了信息天花板"——对同构集成成立，但加入 BST 是引入新信息，属于降低偏差）。见 `RUN_LOG.md`。 |
 | **学习式集成（stacking）** —— `ablation_stacked_ensemble.py`，把上面 6 个成员的分数当特征，学一个线性/MLP 组合器（BPR 目标训练），而不是手工挑融合方式；valid 按用户切 meta_train/meta_dev 防泄漏 | test 最高只到 **0.6028**（线性+L1），没有超过静态加权集成的 **0.6034**。**没有收益，但解释了为什么**：学出来的权重接近均匀（没有重现穷举搜索找到的稀疏子集），L1 正则也没能压出那个子集——L1 依据"训练 loss 还能不能降"，静态方法的穷举搜索依据"验证集排序指标好不好"，两个判据不一样；且组合器只能用 valid 的 70% 拟合参数，穷举搜索能在全部 valid 上直接评估离散候选，候选空间小（252 个）时后者更稳。细节见 `RUN_LOG.md`。 |
+| **官方用户画像 + 视频全站统计** —— `ablation_side_features.py`，用 `user_features_pure.csv`（活跃度/关注数/粉丝数/注册天数分桶）+ `video_features_statistic_pure.csv`（全站曝光量、全站完播率，十分位分桶）；理论依据 LightFM（Kula 2015）式画像 embedding 冷启动缓解机制 | 用户画像 −0.45σ、视频统计 **+1.75σ**（三者里最接近但仍不到 2~3σ 门槛）、两者都加 −0.70σ——都判无收益，且两者叠加**比只加视频统计更差**（−0.0007），是"域数越多不代表越好"的又一次印证。追加测试当异构集成成员：跟 FM 系相关性 0.888~0.960（尤其 fm_watchtime 0.960），完全不在 BST/LightGCN 那个量级——原因是它用的还是同一套 FM 机制，只是多喂了点数据，**决定错误相关性的是模型机制，不是数据来源**。穷举子集搜索完全排除它，集成结果不变（0.6034）。细节见 `RUN_LOG.md`。 |
 | **加静态特征** —— 把 CWM 的 13 个特征域全接进来（+`music_id`/`video_type`/`upload_type` + 6 个用户侧粗桶） | primary **0.5940** vs 5 域的 **0.5950**，噪声内无差别，甚至略降。**没有收益。** |
 | **加模型容量** —— embedding 维度 k = 8 / 16 / 32 | 0.5895 / 0.5902 / 0.5887，几乎不动。**没有收益。** |
 
@@ -296,6 +297,7 @@ print(evaluate(user_ids, labels, scores))   # scores 可以来自任何模型
 | `ablation_ensemble.py` | 同构集成（成员只差 seed）：+0.0007，3 个模型即饱和。见 `RUN_LOG.md`。 |
 | `ablation_hetero_ensemble.py` | **异构集成：项目最好结果 0.6034。** 分成员训练并缓存到 `scores/*.npz`（`--member <name>`）再融合（`--combine`）——一次性训 5 个模型会爆内存。见 `RUN_LOG.md`。 |
 | `ablation_stacked_ensemble.py` | 学习式集成（stacking）：用小模型（线性/MLP）学怎么组合 6 个成员的分数，而不是手工挑固定融合方式。**没有超过静态加权集成**——学出来的权重接近均匀，没能重现穷举搜索找到的稀疏子集。见 `RUN_LOG.md`。 |
+| `ablation_side_features.py` | 官方用户画像 + 视频全站统计（从没被用过的两个数据文件）。单模型无收益（视频统计 1.75σ 最接近但不够），当异构集成成员也无收益（跟 FM 系相关性 0.89~0.96，不够独立）。见 `RUN_LOG.md`。 |
 | `sequence.py` | 用户历史序列构建（numpy-only）。给 `sequence_model.py` 用，也可单独复用。 |
 | `sequence_model.py` | `--arch din`：两版都没有收益，问题在机制不在数据。`--arch bst`：GPU 上验证，比 DIN 高 10+ 个标准误差（证实顺序信息有用），但跟当前最优打平，不采用。见 `RUN_LOG.md`。 |
 | `train_seq.sbatch` | 在 SoC GPU 集群上跑 `sequence_model.py` 的 Slurm 作业脚本（5 seed 并行，`--array=0-4`）。 |
