@@ -1,5 +1,85 @@
 # KuaiRand-Pure Starter Kit
 
+## Project overview (for reviewers)
+
+An autonomous ML research agent (`agent_loop.py`) for the KuaiRand-Pure recommendation
+ranking task, plus a separate, much deeper hand-driven exploration of the same problem
+used as ground truth for judging whether the agent finds real signal. See
+`PROJECT_DESCRIPTION.md` for the full written project description (problem framing,
+tools, APIs, libraries, datasets) and `AGENT_VS_MANUAL.md` for the honest comparison
+between what the autonomous loop found on its own and what the hand-driven research
+found.
+
+**Headline results** (test set, KuaiRand-Pure):
+
+| | GAUC | nDCG@5 | primary | Δ vs. baseline |
+|---|---|---|---|---|
+| Official baseline | 0.6610 | 0.5282 | 0.5946 | — |
+| **Autonomous agent's converged result** (`agent_loop.py`, 5 iterations, 0 manual interventions after launch) | 0.6694 | 0.5329 | 0.6012 | **+0.0066** |
+| Hand-driven exploration's best (heterogeneous ensemble) | 0.6724 | 0.5344 | 0.6034 | +0.0088 |
+
+### Setup and installation
+
+```bash
+git clone https://github.com/gaozilin2005/track2-kuairand.git
+cd track2-kuairand
+python3 -m venv .venv && .venv/bin/pip install torch   # only needed for sequence/graph/ensemble models
+wget https://zenodo.org/records/10439422/files/KuaiRand-Pure.tar.gz
+tar xzf KuaiRand-Pure.tar.gz
+```
+
+The core baseline (`baseline.py`, `data.py`, `evaluate.py`) needs only Python 3.9+ and
+NumPy — no install step beyond the data download.
+
+### Reproduce the results
+
+```bash
+# The autonomous agent, end to end (needs a working `claude` CLI login; ~16 min, <$0.20):
+python3 agent_loop.py --max_iterations 20 --max_wallclock_s 2400 --final_seeds 5
+
+# The hand-driven single-model best (~40s):
+python3 baseline.py --model fm --seed 0
+
+# The hand-driven ensemble best (needs cached member scores in scores/*.npz):
+python3 make_submission.py --mode ensemble --split test --out submission_pure_ens.csv
+```
+
+Every other number in this repository is reproducible via the exact command logged
+alongside it in `RUN_LOG.md` (hand-driven track) or reconstructible from `AGENT_LOG.md`
+(autonomous track).
+
+### Limitations and what we'd improve with more time
+
+- **Innovation is capped by the agent's action space.** `agent_loop.py` selects among
+  loss functions and hyperparameters we already implemented; it doesn't source new
+  methods or write new code. Widening the action space (letting it justify choices with
+  named literature, or propose small code edits within a sandboxed, testable scope)
+  would raise its Innovation ceiling, at some cost to the reliability a narrow space
+  currently buys.
+- **The agent never tried plain BPR as a sanity checkpoint** in its logged run — it
+  jumped straight to more elaborate multi-task losses. A "try the cheapest lever first"
+  heuristic in the prompt would make its search strategy more defensible.
+- **Robustness was verified with a targeted unit test, not an organic failure** — the
+  logged 5-iteration run never actually hit an error. A longer run, or deliberately
+  noisy action space, would give real evidence of the recovery path under natural
+  conditions rather than an injected one.
+- **The two tracks' feature pipelines aren't independent.** The autonomous agent's
+  search operates on top of temporal features (`prior_exposure`, `author_recency`) the
+  hand-driven track discovered and baked into `data.py` permanently. A cleaner
+  experiment would let the agent search over feature inclusion too, to see whether it
+  can independently rediscover that gain rather than inheriting it.
+- **KuaiRand-1K/27K overfit rapidly** (best epoch is usually epoch 1) due to far sparser
+  per-video interaction density than Pure. Addressing this — frequency-based
+  regularization, embedding-dimension scaling by catalog size — was identified but not
+  implemented, given the bonus benchmarks' lower priority.
+- **Sparse-embedding training (`bonus_fm_torch.py`) was necessary but only validated at
+  moderate scale.** It works correctly at 1K/27K; further profiling would help before
+  trusting it at even larger scale.
+
+### Team
+
+Solo participant.
+
 ## 🤖 真正的"自主智能体"交付物：`agent_loop.py`
 
 `RUN_LOG.md`/`ablation_*.py` 那一整套是**人（通过 Claude Code）手工驱动**的研究过程——
