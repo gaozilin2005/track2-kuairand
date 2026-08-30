@@ -182,6 +182,7 @@ if __name__ == '__main__':
     ap.add_argument('--n_layers', type=int, default=3)
     ap.add_argument('--lr', type=float, default=0.001)
     ap.add_argument('--epochs', type=int, default=40)
+    ap.add_argument('--patience', type=int, default=4)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--device', default='auto')
     a = ap.parse_args()
@@ -189,7 +190,7 @@ if __name__ == '__main__':
     splits = load(a.data_dir)
     print({k_: len(v) for k_, v in splits.items()})
     res = run_lightgcn(splits, k=a.k, n_layers=a.n_layers, lr=a.lr,
-                       epochs=a.epochs, seed=a.seed, device=a.device)
+                       epochs=a.epochs, patience=a.patience, seed=a.seed, device=a.device)
     print(f"\n=== lightgcn (seed={a.seed}, k={a.k}, layers={a.n_layers}) ===")
     for sp in ('valid', 'test'):
         r = res[sp]
